@@ -109,7 +109,7 @@ Get API key from [DeepSeek Platform](https://platform.deepseek.com/) for AI-powe
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Telegram Bot  │◄──►│   msg2git App   │◄──►│   GitHub API    │
+│   Telegram Bot  │◄──►│   msg2git App    │◄──►│   GitHub API    │
 │                 │    │                  │    │                 │
 │ • Rate Limited  │    │ • Multi-user     │    │ • Auto-sync     │
 │ • Progress Bars │    │ • Photo CDN      │    │ • Issue Mgmt    │
