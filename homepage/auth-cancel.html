@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitHub OAuth - Cancelled | Msg2Git</title>
+    <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #fbb6ce 0%, #d53f8c 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            animation: slideIn 0.5s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .cancel-icon {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        
+        h1 {
+            color: #2d3748;
+            margin-bottom: 15px;
+            font-size: 2rem;
+            font-weight: 600;
+        }
+        
+        .subtitle {
+            color: #4a5568;
+            margin-bottom: 30px;
+            font-size: 1.1rem;
+            line-height: 1.5;
+        }
+        
+        .info-box {
+            background: #fef5e7;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            border-left: 4px solid #ed8936;
+        }
+        
+        .info-title {
+            font-weight: 600;
+            color: #2d3748;
+            margin-bottom: 10px;
+        }
+        
+        .info-text {
+            color: #4a5568;
+            line-height: 1.5;
+        }
+        
+        .alternatives {
+            text-align: left;
+            margin-bottom: 30px;
+        }
+        
+        .alternatives h3 {
+            color: #2d3748;
+            margin-bottom: 15px;
+            font-size: 1.1rem;
+        }
+        
+        .alternative {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 15px;
+            color: #4a5568;
+            line-height: 1.5;
+        }
+        
+        .alternative-icon {
+            margin-right: 10px;
+            font-size: 1.2rem;
+            margin-top: 2px;
+        }
+        
+        .command {
+            background: #f7fafc;
+            padding: 5px 8px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            color: #2d3748;
+            font-weight: 600;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 12px 25px;
+            border-radius: 25px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+            text-decoration: none;
+            border: none;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #4a5568;
+        }
+        
+        .telegram-link {
+            margin-top: 20px;
+            padding: 15px;
+            background: #0088cc;
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            display: inline-block;
+            transition: background 0.3s ease;
+        }
+        
+        .telegram-link:hover {
+            background: #0077bb;
+        }
+        
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e2e8f0;
+            color: #718096;
+            font-size: 0.9rem;
+        }
+        
+        .benefits {
+            background: #f0fff4;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px 0;
+            border-left: 4px solid #48bb78;
+            text-align: left;
+        }
+        
+        .benefit-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            color: #2d3748;
+        }
+        
+        .benefit-icon {
+            margin-right: 8px;
+            color: #48bb78;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="cancel-icon">⏸️</div>
+        <h1>OAuth Setup Cancelled</h1>
+        <p class="subtitle">You chose not to connect your GitHub account via OAuth</p>
+        
+        <div class="info-box">
+            <div class="info-title">No worries!</div>
+            <div class="info-text">
+                You can still use Gitted Messages with manual setup. This gives you full control over your GitHub credentials.
+            </div>
+        </div>
+        
+        <div class="benefits">
+            <div class="benefit-item">
+                <span class="benefit-icon">🔒</span>
+                <span>Manual setup offers the same security</span>
+            </div>
+            <div class="benefit-item">
+                <span class="benefit-icon">⚡</span>
+                <span>Full control over token permissions</span>
+            </div>
+            <div class="benefit-item">
+                <span class="benefit-icon">🎯</span>
+                <span>Works with all GitHub account types</span>
+            </div>
+        </div>
+        
+        <div class="alternatives">
+            <h3>🛠️ Manual Setup Options:</h3>
+            <div class="alternative">
+                <span class="alternative-icon">📁</span>
+                <span>Use <span class="command">/repo</span> to set your repository</span>
+            </div>
+        </div>
+        
+        <div class="actions">
+            <button class="btn btn-primary" onclick="goToTelegram()">Continue Setup</button>
+        </div>
+        
+        <a href="https://t.me/Msg2GitBot" class="telegram-link">
+            📱 Back to Telegram Bot
+        </a>
+        
+        <div class="footer">
+            <p>💡 Tip: You can always switch to OAuth later with <span class="command">/repo</span> command</p>
+        </div>
+    </div>
+    
+    <script>
+        function goToTelegram() {
+            // Redirect to Telegram bot
+            window.location.href = 'https://t.me/Msg2GitBot';
+        }
+        
+    </script>
+</body>
+</html>

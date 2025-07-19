@@ -1,0 +1,352 @@
+package ratelimit
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/mis2git/mis2git/internal/monitoring/metrics"
+)
+
+// LimitType represents different types of rate limits
+type LimitType string
+
+const (
+	LimitTypeCommand    LimitType = "command_rate"
+	LimitTypeGitHubREST LimitType = "github_rest"
+	LimitTypeGitHubQL   LimitType = "github_graphql"
+	LimitTypeGlobal     LimitType = "global_system"
+)
+
+// RateLimit defines a rate limit configuration
+type RateLimit struct {
+	Requests int           // Number of requests allowed
+	Window   time.Duration // Time window for the limit
+}
+
+// RateLimiter provides rate limiting functionality with Redis backend
+// NOTE: This is the Redis-based implementation. Use MemoryRateLimiter for Redis-free operation.
+type RateLimiter struct {
+	// redis   *redis.Client  // Commented out to remove Redis dependency
+	metrics *metrics.MetricsCollector
+	limits  map[LimitType]RateLimit
+	
+	// Premium multipliers
+	premiumMultipliers map[int]float64
+}
+
+// Config holds rate limiter configuration
+type Config struct {
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+	
+	// Default rate limits
+	CommandLimit    RateLimit
+	GitHubRESTLimit RateLimit
+	GitHubQLLimit   RateLimit
+	GlobalLimit     RateLimit
+	
+	// Premium tier multipliers
+	PremiumMultipliers map[int]float64
+}
+
+// NewRateLimiter creates a new rate limiter with Prometheus integration
+func NewRateLimiter(config Config, metricsCollector *metrics.MetricsCollector) (*RateLimiter, error) {
+	// Create Redis client
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     config.RedisAddr,
+		Password: config.RedisPassword,
+		DB:       config.RedisDB,
+	})
+	
+	// Test Redis connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+	}
+	
+	// Set default premium multipliers if not provided
+	if config.PremiumMultipliers == nil {
+		config.PremiumMultipliers = map[int]float64{
+			0: 1.0, // Free tier
+			1: 2.0, // Coffee tier
+			2: 4.0, // Cake tier
+			3: 10.0, // Sponsor tier
+		}
+	}
+	
+	return &RateLimiter{
+		redis:   rdb,
+		metrics: metricsCollector,
+		limits: map[LimitType]RateLimit{
+			LimitTypeCommand:    config.CommandLimit,
+			LimitTypeGitHubREST: config.GitHubRESTLimit,
+			LimitTypeGitHubQL:   config.GitHubQLLimit,
+			LimitTypeGlobal:     config.GlobalLimit,
+		},
+		premiumMultipliers: config.PremiumMultipliers,
+	}, nil
+}
+
+// CheckLimit checks if a user is within their rate limit
+func (rl *RateLimiter) CheckLimit(ctx context.Context, userID int64, limitType LimitType, premiumLevel int) (bool, error) {
+	// Record the rate limit check
+	defer func() {
+		// This will be set based on the result
+	}()
+	
+	limit, exists := rl.limits[limitType]
+	if !exists {
+		return false, fmt.Errorf("unknown limit type: %s", limitType)
+	}
+	
+	// Apply premium multiplier
+	multiplier := rl.premiumMultipliers[premiumLevel]
+	if multiplier == 0 {
+		multiplier = 1.0 // Default to free tier
+	}
+	
+	adjustedLimit := int(float64(limit.Requests) * multiplier)
+	
+	// Create Redis key
+	key := fmt.Sprintf("rate_limit:%s:%d", limitType, userID)
+	
+	// Use sliding window log algorithm
+	now := time.Now()
+	windowStart := now.Add(-limit.Window)
+	
+	// Remove expired entries and count current requests
+	pipe := rl.redis.Pipeline()
+	pipe.ZRemRangeByScore(ctx, key, "0", strconv.FormatInt(windowStart.UnixNano(), 10))
+	pipe.ZCard(ctx, key)
+	pipe.Expire(ctx, key, limit.Window+time.Minute) // Add buffer to TTL
+	
+	results, err := pipe.Exec(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to check rate limit: %w", err)
+	}
+	
+	// Get current count
+	currentCount, err := results[1].(*redis.IntCmd).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to get current count: %w", err)
+	}
+	
+	allowed := currentCount < int64(adjustedLimit)
+	
+	// Record metrics
+	rl.metrics.RecordRateLimitCheck(userID, string(limitType), allowed)
+	
+	if !allowed {
+		rl.metrics.RecordRateLimitViolation(userID, string(limitType))
+	}
+	
+	return allowed, nil
+}
+
+// ConsumeLimit consumes one request from the rate limit
+func (rl *RateLimiter) ConsumeLimit(ctx context.Context, userID int64, limitType LimitType, premiumLevel int) error {
+	// First check if the request is allowed
+	allowed, err := rl.CheckLimit(ctx, userID, limitType, premiumLevel)
+	if err != nil {
+		return err
+	}
+	
+	if !allowed {
+		return fmt.Errorf("rate limit exceeded for user %d, limit type %s", userID, limitType)
+	}
+	
+	// Add current request to the sliding window
+	key := fmt.Sprintf("rate_limit:%s:%d", limitType, userID)
+	now := time.Now()
+	
+	// Add current timestamp to sorted set
+	err = rl.redis.ZAdd(ctx, key, &redis.Z{
+		Score:  float64(now.UnixNano()),
+		Member: fmt.Sprintf("%d:%d", now.UnixNano(), userID),
+	}).Err()
+	
+	if err != nil {
+		return fmt.Errorf("failed to consume rate limit: %w", err)
+	}
+	
+	return nil
+}
+
+// GetCurrentUsage returns the current usage for a user and limit type
+func (rl *RateLimiter) GetCurrentUsage(ctx context.Context, userID int64, limitType LimitType) (int, error) {
+	limit, exists := rl.limits[limitType]
+	if !exists {
+		return 0, fmt.Errorf("unknown limit type: %s", limitType)
+	}
+	
+	key := fmt.Sprintf("rate_limit:%s:%d", limitType, userID)
+	windowStart := time.Now().Add(-limit.Window)
+	
+	// Remove expired entries and count current requests
+	pipe := rl.redis.Pipeline()
+	pipe.ZRemRangeByScore(ctx, key, "0", strconv.FormatInt(windowStart.UnixNano(), 10))
+	pipe.ZCard(ctx, key)
+	
+	results, err := pipe.Exec(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current usage: %w", err)
+	}
+	
+	currentCount, err := results[1].(*redis.IntCmd).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current count: %w", err)
+	}
+	
+	return int(currentCount), nil
+}
+
+// GetRemainingRequests returns the number of remaining requests for a user
+func (rl *RateLimiter) GetRemainingRequests(ctx context.Context, userID int64, limitType LimitType, premiumLevel int) (int, error) {
+	limit, exists := rl.limits[limitType]
+	if !exists {
+		return 0, fmt.Errorf("unknown limit type: %s", limitType)
+	}
+	
+	// Apply premium multiplier
+	multiplier := rl.premiumMultipliers[premiumLevel]
+	if multiplier == 0 {
+		multiplier = 1.0
+	}
+	
+	adjustedLimit := int(float64(limit.Requests) * multiplier)
+	
+	currentUsage, err := rl.GetCurrentUsage(ctx, userID, limitType)
+	if err != nil {
+		return 0, err
+	}
+	
+	remaining := adjustedLimit - currentUsage
+	if remaining < 0 {
+		remaining = 0
+	}
+	
+	return remaining, nil
+}
+
+// GetResetTime returns when the rate limit will reset for a user
+func (rl *RateLimiter) GetResetTime(ctx context.Context, userID int64, limitType LimitType) (time.Time, error) {
+	limit, exists := rl.limits[limitType]
+	if !exists {
+		return time.Time{}, fmt.Errorf("unknown limit type: %s", limitType)
+	}
+	
+	key := fmt.Sprintf("rate_limit:%s:%d", limitType, userID)
+	
+	// Get the oldest entry in the current window
+	results, err := rl.redis.ZRangeWithScores(ctx, key, 0, 0).Result()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get reset time: %w", err)
+	}
+	
+	if len(results) == 0 {
+		// No requests in window, reset time is now
+		return time.Now(), nil
+	}
+	
+	// Reset time is when the oldest request expires
+	oldestTimestamp := int64(results[0].Score)
+	resetTime := time.Unix(0, oldestTimestamp).Add(limit.Window)
+	
+	return resetTime, nil
+}
+
+// ResetUserLimits resets all rate limits for a user (useful for testing or admin operations)
+func (rl *RateLimiter) ResetUserLimits(ctx context.Context, userID int64) error {
+	pattern := fmt.Sprintf("rate_limit:*:%d", userID)
+	
+	keys, err := rl.redis.Keys(ctx, pattern).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get keys for user %d: %w", userID, err)
+	}
+	
+	if len(keys) > 0 {
+		err = rl.redis.Del(ctx, keys...).Err()
+		if err != nil {
+			return fmt.Errorf("failed to delete keys for user %d: %w", userID, err)
+		}
+	}
+	
+	return nil
+}
+
+// GetGlobalSystemLoad returns the current global system load factor (0-1)
+func (rl *RateLimiter) GetGlobalSystemLoad(ctx context.Context) (float64, error) {
+	// Count total requests across all users in the last minute
+	pattern := "rate_limit:*"
+	keys, err := rl.redis.Keys(ctx, pattern).Result()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get global keys: %w", err)
+	}
+	
+	totalRequests := 0
+	windowStart := time.Now().Add(-time.Minute)
+	
+	for _, key := range keys {
+		count, err := rl.redis.ZCount(ctx, key, strconv.FormatInt(windowStart.UnixNano(), 10), "+inf").Result()
+		if err != nil {
+			continue // Skip errors for individual keys
+		}
+		totalRequests += int(count)
+	}
+	
+	// Calculate load factor based on some reasonable maximum
+	// This is configurable based on your system capacity
+	maxRequestsPerMinute := 10000 // Adjust based on your system
+	loadFactor := float64(totalRequests) / float64(maxRequestsPerMinute)
+	
+	if loadFactor > 1.0 {
+		loadFactor = 1.0
+	}
+	
+	// Update Prometheus metric
+	rl.metrics.UpdateSystemLoadFactor(loadFactor)
+	
+	return loadFactor, nil
+}
+
+// Close closes the Redis connection
+func (rl *RateLimiter) Close() error {
+	return rl.redis.Close()
+}
+
+// DefaultConfig returns a default configuration for the rate limiter
+func DefaultConfig() Config {
+	return Config{
+		RedisAddr:     "localhost:6379",
+		RedisPassword: "",
+		RedisDB:       0,
+		
+		CommandLimit: RateLimit{
+			Requests: 30,               // 30 commands per minute
+			Window:   time.Minute,
+		},
+		GitHubRESTLimit: RateLimit{
+			Requests: 60,               // 60 REST requests per hour (conservative)
+			Window:   time.Hour,
+		},
+		GitHubQLLimit: RateLimit{
+			Requests: 100,              // 100 GraphQL points per hour (conservative)
+			Window:   time.Hour,
+		},
+		GlobalLimit: RateLimit{
+			Requests: 1000,             // 1000 total requests per hour per user
+			Window:   time.Hour,
+		},
+		
+		PremiumMultipliers: map[int]float64{
+			0: 1.0,  // Free tier
+			1: 2.0,  // Coffee tier - 2x limits
+			2: 4.0,  // Cake tier - 4x limits
+			3: 10.0, // Sponsor tier - 10x limits
+		},
+	}
+}

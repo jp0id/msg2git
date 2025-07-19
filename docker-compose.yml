@@ -1,0 +1,15 @@
+services:
+  msg2git:
+    image: msg2git:latest  # build 成 image，减少构建时间
+    build:
+      context: .
+    container_name: msg2git
+    restart: unless-stopped
+    volumes:
+      - ./notes-repo:/app/notes-repo
+    env_file:
+      - .minimal2.env
+    # environment:
+    #   - HTTP_PROXY=http://host.docker.internal:7890
+    #   - HTTPS_PROXY=http://host.docker.internal:7890
+    #   - NO_PROXY=localhost,127.0.0.1

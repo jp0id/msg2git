@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Msg2Git - Git-Powered Alternative to Telegram Saved Messages</title>
+    <meta name="description" content="Finally, organized messages with git version control. A superior alternative to Telegram Saved Messages with structured files, searchable history, and full ownership.">
+    
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://www.msg2git.com/">
+    <meta property="og:title" content="Msg2Git - Git-Powered Alternative to Telegram Saved Messages">
+    <meta property="og:description" content="Finally, organized messages with git version control. A superior alternative to Telegram Saved Messages with structured files, searchable history, and full ownership.">
+    
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image">
+    <meta property="twitter:url" content="https://www.msg2git.com/">
+    <meta property="twitter:title" content="Msg2Git - Git-Powered Alternative to Telegram Saved Messages">
+    <meta property="twitter:description" content="Finally, organized messages with git version control. A superior alternative to Telegram Saved Messages with structured files, searchable history, and full ownership.">
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        header {
+            padding: 2rem 0;
+            text-align: center;
+            color: white;
+        }
+        
+        .logo {
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        
+        .logo img {
+            height: 60px;
+            width: auto;
+            filter: drop-shadow(0 2px 4px rgba(0,0,0,0.2));
+        }
+        
+        .logo-text {
+            font-size: 3rem;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .tagline {
+            font-size: 1.2rem;
+            opacity: 0.9;
+            margin-bottom: 2rem;
+        }
+        
+        .cta-button {
+            display: inline-block;
+            background: #0088cc;
+            color: white;
+            padding: 15px 30px;
+            border-radius: 25px;
+            text-decoration: none;
+            font-weight: bold;
+            font-size: 1.1rem;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+        }
+        
+        .cta-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+        }
+        
+        .main-content {
+            background: white;
+            border-radius: 20px 20px 0 0;
+            margin-top: 2rem;
+            padding: 3rem 0;
+            box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.1);
+        }
+        
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin: 3rem 0;
+        }
+        
+        .feature {
+            text-align: center;
+            padding: 2rem;
+            border-radius: 10px;
+            background: #f8f9fa;
+            transition: transform 0.3s ease;
+        }
+        
+        .feature:hover {
+            transform: translateY(-5px);
+        }
+        
+        .feature-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+        
+        .feature h3 {
+            color: #333;
+            margin-bottom: 1rem;
+            font-size: 1.3rem;
+        }
+        
+        .feature p {
+            color: #666;
+            line-height: 1.6;
+        }
+        
+        .how-it-works {
+            text-align: center;
+            margin: 4rem 0;
+        }
+        
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+            margin: 2rem 0;
+        }
+        
+        .step {
+            padding: 1.5rem;
+        }
+        
+        .step-number {
+            background: #667eea;
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin: 0 auto 1rem;
+        }
+        
+        .pricing {
+            background: #f8f9fa;
+            padding: 3rem 0;
+            text-align: center;
+        }
+        
+        .pricing-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 2rem;
+            margin: 2rem 0;
+        }
+        
+        .pricing-card {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+            position: relative;
+        }
+        
+        .pricing-card.popular {
+            border: 3px solid #667eea;
+        }
+        
+        .popular-badge {
+            position: absolute;
+            top: -10px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #667eea;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 15px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        
+        .price {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #333;
+            margin: 1rem 0;
+        }
+        
+        .footer {
+            background: #333;
+            color: white;
+            text-align: center;
+            padding: 2rem 0;
+        }
+        
+        .footer-links {
+            margin: 1rem 0;
+        }
+        
+        .footer-links a {
+            color: #ccc;
+            text-decoration: none;
+            margin: 0 1rem;
+        }
+        
+        .footer-links a:hover {
+            color: white;
+        }
+        
+        @media (max-width: 768px) {
+            .logo img {
+                height: 45px;
+            }
+            
+            .logo-text {
+                font-size: 2rem;
+            }
+            
+            .tagline {
+                font-size: 1rem;
+            }
+            
+            .container {
+                padding: 0 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <div class="logo">
+                <img src="logo.jpg" alt="Msg2Git Logo" onerror="this.style.display='none'">
+                <span class="logo-text">Msg2Git</span>
+            </div>
+            <div class="tagline">Git-Powered Alternative to Telegram Saved Messages</div>
+            <div style="margin: 1.5rem 0; display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; align-items: center;">
+                <a href="https://t.me/Msg2GitBot" class="cta-button">🚀 Start Now - It's Free!</a>
+                <a href="https://github.com/msg2git/msg2git" 
+                   style="display: inline-flex; align-items: center; gap: 0.5rem; background: rgba(255,255,255,0.2); color: white; padding: 12px 20px; border-radius: 20px; text-decoration: none; font-weight: 500; transition: all 0.3s; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.3);"
+                   onmouseover="this.style.background='rgba(255,255,255,0.3)'; this.style.transform='translateY(-2px)'"
+                   onmouseout="this.style.background='rgba(255,255,255,0.2)'; this.style.transform='translateY(0)'">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                    ⭐ Star on GitHub
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <div class="main-content">
+        <div class="container">
+            <section class="hero">
+                <h1 style="text-align: center; margin-bottom: 2rem; font-size: 2.5rem; color: #333;">
+                    Finally, Organized Messages with Git Version Control
+                </h1>
+                <p style="text-align: center; font-size: 1.2rem; color: #666; max-width: 800px; margin: 0 auto;">
+                    Tired of messy Telegram Saved Messages? Msg2Git brings order to chaos with git-powered organization. 
+                    Send messages to structured files, track changes, search history, and never lose important thoughts again.
+                    <br><br>
+                    <strong style="color: #333;">Why settle for unorganized feeds when you can have searchable, versioned, and organized notes?</strong>
+                </p>
+            </section>
+
+            <section class="features">
+                <div class="feature">
+                    <div class="feature-icon">🗂️</div>
+                    <h3>Organized vs. Chaos</h3>
+                    <p>Unlike Telegram Saved Messages' endless feed, your messages are organized into structured files with categories, searchable content, and version history.</p>
+                </div>
+                
+                <div class="feature">
+                    <div class="feature-icon">🔍</div>
+                    <h3>Never Lose Messages Again</h3>
+                    <p>Git-powered search and history mean you can find any message, photo, or idea from months ago. Try doing that with Gitted Messages!</p>
+                </div>
+                
+                <div class="feature">
+                    <div class="feature-icon">📱</div>
+                    <h3>Same Telegram Experience</h3>
+                    <p>Keep using Telegram like you always do - just send messages, photos, and ideas. The magic happens behind the scenes with git organization.</p>
+                </div>
+                
+                <div class="feature">
+                    <div class="feature-icon">✅</div>
+                    <h3>Actionable Todo Management</h3>
+                    <p>Transform random thoughts into actionable tasks with todos, GitHub issues. Saved Messages just pile up - these actually get done.</p>
+                </div>
+                
+                <div class="feature">
+                    <div class="feature-icon">🔗</div>
+                    <h3>GitHub Integration</h3>
+                    <p>Your messages live in YOUR GitHub repository. Export, backup, or integrate with any tool that works with git. Full ownership and control.</p>
+                </div>
+                
+                <div class="feature">
+                    <div class="feature-icon">📊</div>
+                    <h3>Version History & Analytics</h3>
+                    <p>See when you wrote what, track your productivity patterns, and use git's powerful history features to understand your thinking over time.</p>
+                </div>
+            </section>
+
+            <section class="demo-video" style="text-align: center; margin: 4rem 0; padding: 3rem 0; background: #f8f9fa; border-radius: 15px;">
+                <div class="container">
+                    <h2 style="font-size: 2rem; margin-bottom: 1rem; color: #333;">🎥 See It In Action</h2>
+                    <p style="color: #666; margin-bottom: 2rem; font-size: 1.1rem;">Watch our 8-minute tutorial showcasing all the awesome features</p>
+                    <div style="max-width: 800px; margin: 0 auto; position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden; border-radius: 15px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);">
+                        <iframe 
+                            style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none;" 
+                            src="https://www.youtube.com/embed/OJGsxP-D6VM" 
+                            title="Msg2Git Tutorial - All Features Demo" 
+                            frameborder="0" 
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+                            allowfullscreen>
+                        </iframe>
+                    </div>
+                    <p style="color: #888; margin-top: 1rem; font-size: 0.9rem;">
+                        Learn how to set up your repository, send messages, create issues, and leverage AI features
+                    </p>
+                </div>
+            </section>
+
+            <section class="developer-highlights" style="background: #f8f9fa; padding: 3rem 0; margin: 3rem 0; border-radius: 15px;">
+                <div class="container">
+                    <h2 style="text-align: center; font-size: 2rem; margin-bottom: 3rem; color: #333;">🚀 Developer Superpowers</h2>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 3rem; max-width: 1000px; margin: 0 auto;">
+                        <div style="background: white; padding: 2.5rem; border-radius: 15px; box-shadow: 0 5px 20px rgba(0, 0, 0, 0.1); border-left: 5px solid #667eea;">
+                            <div style="font-size: 2.5rem; margin-bottom: 1rem;">⚡️</div>
+                            <h3 style="color: #333; margin-bottom: 1rem; font-size: 1.4rem;">GitHub Issue Management</h3>
+                            <p style="color: #666; margin-bottom: 1.5rem; line-height: 1.6;">Create, comment, and close GitHub issues directly from Telegram. Full support for:</p>
+                            <ul style="color: #666; padding-left: 1.5rem; line-height: 1.8;">
+                                <li><strong>Code Blocks:</strong> <code style="background: #f1f3f4; padding: 2px 6px; border-radius: 3px;">```diff</code>, <code style="background: #f1f3f4; padding: 2px 6px; border-radius: 3px;">```js</code>, <code style="background: #f1f3f4; padding: 2px 6px; border-radius: 3px;">```python</code>, etc</li>
+                                <li><strong>Checkboxes:</strong> <code style="background: #f1f3f4; padding: 2px 6px; border-radius: 3px;">- [ ] task</code></li>
+                                <li><strong>Other Markdowns:</strong> <code style="background: #f1f3f4; padding: 2px 6px; border-radius: 3px;">| column1 | column2 |</code></li>
+                                <li><strong>Status Sync:</strong> Real-time issue status sync</li>
+                                <li><strong>Query:</strong> List and Comment latest open issues</li>
+                                <li><strong>Picture:</strong> Create or Comment a issue with picture</li>
+                            </ul>
+                        </div>
+                        
+                        <div style="background: white; padding: 2.5rem; border-radius: 15px; box-shadow: 0 5px 20px rgba(0, 0, 0, 0.1); border-left: 5px solid #28a745;">
+                            <div style="font-size: 2.5rem; margin-bottom: 1rem;">🤖</div>
+                            <h3 style="color: #333; margin-bottom: 1rem; font-size: 1.4rem;">AI-Powered Organization</h3>
+                            <p style="color: #666; margin-bottom: 1.5rem; line-height: 1.6;">Optional LLM integration currently enhances your messages with:</p>
+                            <ul style="color: #666; padding-left: 1.5rem; line-height: 1.8;">
+                                <li><strong>Smart Titles:</strong> Auto-generated descriptive message titles</li>
+                                <li><strong>Hashtags:</strong> Contextual keywords for better searchability</li>
+                                <li><strong>Multimodal:</strong> Generate titles for pictures without captions</li>
+                            </ul>
+                            <p style="color: #888; margin: 1rem 0; font-size: 0.9rem;"><em>Coming soon: Smart categorization and content format enhancement</em></p>
+                            <p style="color: #888; font-size: 0.9rem; margin-top: 1rem; font-style: italic;">Use your own LLM (Gemini, DeepSeek) or our default LLM with 100,000 free tokens.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="self-hosting" style="background: #f0f7ff; padding: 3rem 0; margin: 3rem 0; border-radius: 15px; border: 2px solid #e3f2fd;">
+                <div class="container">
+                    <h2 style="text-align: center; font-size: 2rem; margin-bottom: 2rem; color: #333;">🏠 Self-Host Your Own Instance</h2>
+                    <p style="text-align: center; color: #666; margin-bottom: 3rem; font-size: 1.1rem; max-width: 800px; margin-left: auto; margin-right: auto;">
+                        Want complete control? Deploy your own Msg2Git instance with Docker in minutes. 
+                        <strong>100% open source</strong> under MIT license.
+                    </p>
+                    
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 2rem; margin-bottom: 3rem;">
+                        <div style="background: white; padding: 2rem; border-radius: 10px; box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);">
+                            <h3 style="color: #333; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
+                                🐳 One-Click Docker Deploy
+                            </h3>
+                            <pre style="background: #f8f9fa; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: 0.9rem; margin: 1rem 0;"><code>git clone https://github.com/msg2git/msg2git.git
+cd msg2git
+docker-compose up -d</code></pre>
+                            <p style="color: #666; font-size: 0.9rem;">Includes PostgreSQL database, automatic SSL, and health monitoring.</p>
+                        </div>
+                        
+                        <div style="background: white; padding: 2rem; border-radius: 10px; box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);">
+                            <h3 style="color: #333; margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem;">
+                                ⚡ Why Self-Host?
+                            </h3>
+                            <ul style="color: #666; padding-left: 1.5rem; line-height: 1.8; margin: 1rem 0;">
+                                <li><strong>Full Control:</strong> Your data, your rules</li>
+                                <li><strong>No Limits:</strong> Unlimited storage & usage</li>
+                                <li><strong>Customization:</strong> Modify features as needed</li>
+                                <li><strong>Privacy:</strong> Keep sensitive data on-premise</li>
+                                <li><strong>Cost Effective:</strong> No monthly fees</li>
+                            </ul>
+                        </div>
+                    </div>
+                    
+                    <div style="text-align: center; margin-top: 2rem;">
+                        <a href="https://github.com/msg2git/msg2git" 
+                           style="display: inline-flex; align-items: center; gap: 0.5rem; background: #333; color: white; padding: 15px 25px; border-radius: 25px; text-decoration: none; font-weight: bold; transition: all 0.3s; box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);"
+                           onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 6px 20px rgba(0, 0, 0, 0.3)'"
+                           onmouseout="this.style.transform='translateY(0)'; this.style.boxShadow='0 4px 15px rgba(0, 0, 0, 0.2)'">
+                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                            </svg>
+                            📖 View Documentation & Deploy Guide
+                        </a>
+                    </div>
+                </div>
+            </section>
+
+            <section class="how-it-works">
+                <h2 style="font-size: 2rem; margin-bottom: 2rem; color: #333;">How It Works</h2>
+                <div class="steps">
+                    <div class="step">
+                        <div class="step-number">1</div>
+                        <h3>Setup Repository</h3>
+                        <p>Connect your GitHub account and choose your repository using /repo command</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">2</div>
+                        <h3>Send Messages</h3>
+                        <p>Send any text, photo, or idea directly to the Telegram bot</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">3</div>
+                        <h3>Choose Location</h3>
+                        <p>Select where to save your message using interactive buttons</p>
+                    </div>
+                    <div class="step">
+                        <div class="step-number">4</div>
+                        <h3>Auto Commit</h3>
+                        <p>Your message is automatically committed to GitHub with smart formatting</p>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <section class="pricing">
+        <div class="container">
+            <h2 style="font-size: 2rem; margin-bottom: 2rem; color: #333;">Simple, Transparent Pricing</h2>
+            
+            <!-- Pricing Toggle -->
+            <div style="text-align: center; margin-bottom: 2rem;">
+                <div style="display: inline-flex; background: #f1f3f4; border-radius: 25px; padding: 3px;">
+                    <button id="monthlyBtn" onclick="togglePricing('monthly')" style="padding: 8px 20px; border: none; border-radius: 22px; background: #667eea; color: white; font-weight: 500; cursor: pointer; transition: all 0.3s;">Monthly</button>
+                    <button id="annualBtn" onclick="togglePricing('annual')" style="padding: 8px 20px; border: none; border-radius: 22px; background: transparent; color: #666; font-weight: 500; cursor: pointer; transition: all 0.3s;">Annual <span style="font-size: 0.8rem; color: #28a745;">(Save 50%)</span></button>
+                </div>
+            </div>
+            <div class="pricing-grid">
+                <div class="pricing-card">
+                    <h3>Free</h3>
+                    <div class="price">$0</div>
+                    <ul style="text-align: left; margin: 1rem 0;">
+                        <li>✅ 100,000 free llm tokens</li>
+                        <li>✅ 1MB repository size</li>
+                        <li>✅ 90 photos free upload</li>
+                        <li>✅ 90 issues free create</li>
+                        <li>✅ 1 Custom file path</li>
+                        <li>✅ Core features</li>
+                    </ul>
+                </div>
+                
+                <div class="pricing-card popular">
+                    <div class="popular-badge">Most Popular</div>
+                    <h3>☕ Coffee</h3>
+                    <div class="price">
+                        <span class="monthly-price">$1<span style="font-size: 1rem; color: #666;">/month</span></span>
+                        <span class="annual-price" style="display: none;">$6<span style="font-size: 1rem; color: #666;">/year</span></span>
+                    </div>
+                    <ul style="text-align: left; margin: 1rem 0;">
+                        <li>✅ 2x free llm tokens</li>
+                        <li>✅ 2x repository size</li>
+                        <li>✅ 2x photo upload limit</li>
+                        <li>✅ 2x issue create limit</li>
+                        <li>✅ 2x Custom file paths</li>
+                        <li>✅ Priority support</li>
+                    </ul>
+                </div>
+                
+                <div class="pricing-card">
+                    <h3>🍰 Cake</h3>
+                    <div class="price">
+                        <span class="monthly-price">$2<span style="font-size: 1rem; color: #666;">/month</span></span>
+                        <span class="annual-price" style="display: none;">$12<span style="font-size: 1rem; color: #666;">/year</span></span>
+                    </div>
+                    <ul style="text-align: left; margin: 1rem 0;">
+                        <li>✅ 4x free llm tokens</li>
+                        <li>✅ 4x repository size</li>
+                        <li>✅ 4x photo upload limit</li>
+                        <li>✅ 4x issue create limit</li>
+                        <li>✅ 4x Custom file paths</li>
+                        <li>✅ Priority support</li>
+                    </ul>
+                </div>
+                
+                <div class="pricing-card">
+                    <h3>🎁 Sponsor</h3>
+                    <div class="price">
+                        <span class="monthly-price">$5<span style="font-size: 1rem; color: #666;">/month</span></span>
+                        <span class="annual-price" style="display: none;">$30<span style="font-size: 1rem; color: #666;">/year</span></span>
+                    </div>
+                    <ul style="text-align: left; margin: 1rem 0;">
+                        <li>✅ 10x free llm tokens</li>
+                        <li>✅ 10x repository size</li>
+                        <li>✅ 10x photo upload limit</li>
+                        <li>✅ 10x issue create limit</li>
+                        <li>✅ 10x Custom file paths</li>
+                        <li>✅ Priority support</li>
+                    </ul>
+                </div>
+            </div>
+            
+            <div style="margin-top: 2rem;">
+                <a href="https://t.me/Msg2GitBot" class="cta-button">Get Started for Free</a>
+            </div>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-links">
+                <a href="https://github.com/msg2git/msg2git" style="font-weight: bold;">⭐ GitHub</a>
+                <a href="/contact">Contact Us</a>
+                <a href="/privacy">Privacy Policy</a>
+                <a href="/terms">Terms of Service</a>
+                <a href="/refund">Refund Policy</a>
+            </div>
+            <p>&copy; 2025 Msg2Git. Made with ❤️ for developers. 
+               <a href="https://github.com/msg2git/msg2git" style="color: #ccc; text-decoration: underline;">Open Source on GitHub</a>
+            </p>
+        </div>
+    </footer>
+
+    <script>
+        function togglePricing(period) {
+            const monthlyBtn = document.getElementById('monthlyBtn');
+            const annualBtn = document.getElementById('annualBtn');
+            const monthlyPrices = document.querySelectorAll('.monthly-price');
+            const annualPrices = document.querySelectorAll('.annual-price');
+            
+            if (period === 'monthly') {
+                // Style buttons
+                monthlyBtn.style.background = '#667eea';
+                monthlyBtn.style.color = 'white';
+                annualBtn.style.background = 'transparent';
+                annualBtn.style.color = '#666';
+                
+                // Show monthly prices
+                monthlyPrices.forEach(price => price.style.display = 'inline');
+                annualPrices.forEach(price => price.style.display = 'none');
+            } else {
+                // Style buttons
+                annualBtn.style.background = '#667eea';
+                annualBtn.style.color = 'white';
+                monthlyBtn.style.background = 'transparent';
+                monthlyBtn.style.color = '#666';
+                
+                // Show annual prices
+                monthlyPrices.forEach(price => price.style.display = 'none');
+                annualPrices.forEach(price => price.style.display = 'inline');
+            }
+        }
+        
+        // Default to monthly view
+        document.addEventListener('DOMContentLoaded', function() {
+            togglePricing('monthly');
+        });
+    </script>
+</body>
+</html>

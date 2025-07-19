@@ -1,0 +1,21 @@
+services:
+  homepage:
+    image: msg2gitweb:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: msg2git-homepage
+    platform: linux/amd64
+    ports:
+      - "80:80"
+    restart: unless-stopped
+    environment:
+      - NGINX_HOST=www.msg2git.com
+      - NGINX_PORT=80
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+

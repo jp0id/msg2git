@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Successful - Msg2Git</title>
+    <meta name="description" content="Payment successful! Thank you for upgrading to Msg2Git premium. This page will close automatically.">
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .success-container {
+            background: white;
+            padding: 3rem;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            text-align: center;
+            max-width: 500px;
+            width: 90%;
+            animation: slideIn 0.5s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .success-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+            animation: bounce 1s ease-out;
+        }
+        
+        @keyframes bounce {
+            0%, 20%, 50%, 80%, 100% {
+                transform: translateY(0);
+            }
+            40% {
+                transform: translateY(-10px);
+            }
+            60% {
+                transform: translateY(-5px);
+            }
+        }
+        
+        .success-title {
+            color: #333;
+            font-size: 2rem;
+            margin-bottom: 1rem;
+            font-weight: bold;
+        }
+        
+        .success-message {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }
+        
+        .info-container {
+            background: #e8f5e8;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin: 2rem 0;
+            border: 2px solid #c3e6c3;
+        }
+        
+        .info-text {
+            color: #2d5a2d;
+            font-weight: 500;
+            text-align: center;
+        }
+        
+        .next-steps {
+            background: #e3f2fd;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin: 2rem 0;
+            text-align: left;
+        }
+        
+        .next-steps h3 {
+            color: #333;
+            margin-bottom: 1rem;
+            text-align: center;
+        }
+        
+        .next-steps ul {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .next-steps li {
+            margin: 0.5rem 0;
+            padding-left: 1.5rem;
+            position: relative;
+        }
+        
+        .next-steps li::before {
+            content: "✅";
+            position: absolute;
+            left: 0;
+        }
+        
+        
+        .telegram-link {
+            background: #0088cc;
+            color: white;
+            text-decoration: none;
+            padding: 1rem 2rem;
+            border-radius: 25px;
+            display: inline-block;
+            font-weight: bold;
+            margin: 1rem 0;
+            transition: all 0.3s ease;
+        }
+        
+        .telegram-link:hover {
+            background: #006ba8;
+            color: white;
+            text-decoration: none;
+            transform: translateY(-2px);
+        }
+        
+        .support-info {
+            font-size: 0.9rem;
+            color: #888;
+            margin-top: 2rem;
+            padding-top: 2rem;
+            border-top: 1px solid #eee;
+        }
+    </style>
+</head>
+<body>
+    <div class="success-container">
+        <div class="success-icon">🎉</div>
+        <h1 class="success-title" id="paymentTitle">Payment Successful!</h1>
+        <p class="success-message" id="paymentMessage">
+            Thank you for your payment! Your transaction has been processed successfully.
+        </p>
+        
+        <div class="info-container">
+            <div class="info-text" id="infoText">🎉 Payment completed successfully! You can now return to Telegram.</div>
+        </div>
+        
+        <div class="next-steps" id="nextSteps">
+            <h3>🚀 What's Next?</h3>
+            <ul id="stepsList">
+                <li>Return to Telegram</li>
+                <li>Check your updated status</li>
+            </ul>
+        </div>
+        
+        <br>
+        
+        
+        <div class="support-info">
+            <strong>Need Help?</strong><br>
+            Contact us through the Telegram bot or email support@msg2git.com
+        </div>
+    </div>
+
+    <script>
+        // Get URL parameters to determine payment type
+        const urlParams = new URLSearchParams(window.location.search);
+        const sessionId = urlParams.get('session_id');
+        
+        // Function to detect payment type from session ID patterns or additional URL params
+        function detectPaymentType() {
+            // Check for explicit payment type parameter
+            const paymentType = urlParams.get('type');
+            if (paymentType) {
+                return paymentType;
+            }
+            
+            // Check for reset parameter (legacy support)
+            const isReset = urlParams.get('reset');
+            if (isReset === 'true' || isReset === '1') {
+                return 'reset';
+            }
+            
+            // For now, we'll default to subscription if we can't determine
+            // In the future, this could make an API call to check the session type
+            return 'subscription';
+        }
+        
+        // Update page content based on payment type
+        function updateContent() {
+            const paymentType = detectPaymentType();
+            
+            const titleElement = document.getElementById('paymentTitle');
+            const messageElement = document.getElementById('paymentMessage');
+            const infoElement = document.getElementById('infoText');
+            const stepsElement = document.getElementById('stepsList');
+            
+            if (paymentType === 'reset') {
+                // Reset Usage Payment ($1.00)
+                titleElement.textContent = 'Usage Reset Successful!';
+                messageElement.innerHTML = 'Your usage counters have been reset! You can now continue using Msg2Git with your full monthly allocation.';
+                infoElement.innerHTML = '🔄 Usage reset completed! All your counters are now back to zero.';
+                
+                stepsElement.innerHTML = `
+                    <li>Return to Telegram and continue creating content</li>
+                    <li>Your issue creation counter is reset to zero</li>
+                    <li>Your photo upload counter is reset to zero</li>
+                    <li>Your free LLM token usage is reset to zero</li>
+                    <li>Use /insight to see your updated usage limits</li>
+                    <li>Continue enjoying your current premium tier benefits</li>
+                `;
+            } else if (paymentType === 'subscription') {
+                // Premium Subscription Payment
+                const tier = urlParams.get('tier') || 'Premium';
+                const billing = urlParams.get('billing') || 'subscription';
+                
+                titleElement.textContent = 'Premium Subscription Activated!';
+                messageElement.innerHTML = `Thank you for subscribing to Msg2Git Premium! Your subscription is now active and you can enjoy all the enhanced features.`;
+                infoElement.innerHTML = '🎉 Premium subscription unlocked! You can now return to Telegram to use your enhanced capabilities.';
+                
+                // Get tier-specific multiplier for benefits
+                let multiplier = '2x';
+                let tierIcon = '☕';
+                if (tier.toLowerCase().includes('cake')) {
+                    multiplier = '4x';
+                    tierIcon = '🍰';
+                } else if (tier.toLowerCase().includes('sponsor')) {
+                    multiplier = '10x';
+                    tierIcon = '🎁';
+                }
+                
+                stepsElement.innerHTML = `
+                    <li>Return to Telegram and start using your Premium features</li>
+                    <li>Your usage limits have been increased immediately</li>
+                    <li>Creating More photos and GitHub issues</li>
+                    <li>Explore custom files and AI features</li>
+                    <li>Use /insight to see your new premium limits</li>
+                    <li>Use /coffee to manage your subscription anytime</li>
+                `;
+            } else {
+                // Default/Unknown Payment Type
+                titleElement.textContent = 'Payment Successful!';
+                messageElement.innerHTML = 'Thank you for your payment! Your transaction has been processed successfully.';
+                infoElement.innerHTML = '🎉 Payment completed successfully! You can now return to Telegram.';
+                
+                stepsElement.innerHTML = `
+                    <li>Return to Telegram and check your updated status</li>
+                    <li>Use /insight to see your current limits and usage</li>
+                    <li>Continue enjoying Msg2Git features</li>
+                `;
+            }
+        }
+        
+        // Update content when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            updateContent();
+        });
+    </script>
+</body>
+</html>

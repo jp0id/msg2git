@@ -1,0 +1,2587 @@
+package telegram
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/mis2git/mis2git/internal/cache"
+	"github.com/mis2git/mis2git/internal/config"
+	"github.com/mis2git/mis2git/internal/consts"
+	"github.com/mis2git/mis2git/internal/database"
+	"github.com/mis2git/mis2git/internal/file"
+	"github.com/mis2git/mis2git/internal/github"
+	"github.com/mis2git/mis2git/internal/llm"
+	"github.com/mis2git/mis2git/internal/logger"
+	"golang.org/x/time/rate"
+)
+
+type Bot struct {
+	api             *tgbotapi.BotAPI
+	fileManager     *file.Manager
+	githubManager   *github.Manager   // Default GitHub manager (from .env)
+	llmClient       *llm.Client       // Default LLM client (from .env)
+	pendingMessages map[string]string // messageID -> content
+	config          *config.Config    // Store config for runtime updates
+	db              *database.DB      // Database for multi-user support
+	cache           *cache.Cache      // Cache for storing frequently accessed data
+
+	// Rate limiting
+	globalLimiter  *rate.Limiter           // Global rate limiter (30 msg/sec)
+	userLimiters   map[int64]*rate.Limiter // Per-user rate limiters (1 msg/user/sec)
+	userLimitersMu sync.RWMutex            // Protects userLimiters map
+	cleanupStarted bool                    // Track if cleanup goroutine is started
+
+	// Callback deduplication
+	processedCallbacks   map[string]time.Time // callback_id -> timestamp
+	callbacksMu          sync.RWMutex         // Protects processedCallbacks map
+}
+
+func NewBot(cfg *config.Config) (*Bot, error) {
+	api, err := tgbotapi.NewBotAPI(cfg.TelegramBotToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
+	}
+
+	// Initialize database (optional)
+	var db *database.DB
+	if cfg.HasDatabaseConfig() {
+		db, err = database.NewDB(cfg.PostgreDSN, cfg.TokenPassword)
+		if err != nil {
+			logger.Warn("Failed to initialize database", map[string]interface{}{
+				"error": err.Error(),
+			})
+			logger.InfoMsg("Continuing without database support...")
+		} else {
+			logger.InfoMsg("Database initialized successfully")
+		}
+	} else {
+		logger.InfoMsg("No database configured, using single-user mode")
+	}
+
+	// No default GitHub manager or LLM client - everything is database-controlled
+
+
+	return &Bot{
+		api:             api,
+		fileManager:     file.NewManager(),
+		githubManager:   nil,
+		llmClient:       nil,
+		pendingMessages: make(map[string]string),
+		config:          cfg,
+		db:              db,
+		cache:           cache.NewWithConfig(1000, 30*time.Minute, 5*time.Minute), // Large cache with 30-minute expiry
+
+		// Initialize rate limiters
+		globalLimiter:  rate.NewLimiter(rate.Limit(5000), 5000), // 5000 messages per second with burst of 5000
+		userLimiters:   make(map[int64]*rate.Limiter),
+		userLimitersMu: sync.RWMutex{},
+		cleanupStarted: false,
+
+		// Initialize callback deduplication
+		processedCallbacks: make(map[string]time.Time),
+		callbacksMu:        sync.RWMutex{},
+	}, nil
+}
+
+func (b *Bot) Start() error {
+	logger.Info("Bot authorized and starting", map[string]interface{}{
+		"username":          b.api.Self.UserName,
+		"global_rate_limit": "5000 msg/sec",
+		"user_rate_limit":   "30 msg/user/sec",
+	})
+
+	// Start webhook server for Stripe payments
+	b.StartWebhookServer()
+
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+	u.AllowedUpdates = []string{"message", "edited_message", "callback_query"}
+
+	updates := b.api.GetUpdatesChan(u)
+
+	for update := range updates {
+		logger.Debug("Received update", map[string]interface{}{
+			"update_id":    update.UpdateID,
+			"has_message":  update.Message != nil,
+			"has_callback": update.CallbackQuery != nil,
+		})
+
+		if update.CallbackQuery != nil {
+			if err := b.handleCallbackQuery(update.CallbackQuery); err != nil {
+				logger.Error("Error handling callback query", map[string]interface{}{
+					"error":   err.Error(),
+					"chat_id": update.CallbackQuery.Message.Chat.ID,
+				})
+				b.sendErrorResponse(update.CallbackQuery.Message.Chat.ID, err)
+			}
+			continue
+		}
+
+		if update.Message == nil {
+			logger.Debug("Update has no message, skipping", nil)
+			continue
+		}
+
+		logger.Debug("Processing message from user", map[string]interface{}{
+			"username": update.Message.From.UserName,
+			"chat_id":  update.Message.Chat.ID,
+		})
+
+		if err := b.handleMessage(update.Message); err != nil {
+			logger.Error("Error handling message", map[string]interface{}{
+				"error":    err.Error(),
+				"username": update.Message.From.UserName,
+				"chat_id":  update.Message.Chat.ID,
+			})
+			b.sendErrorResponse(update.Message.Chat.ID, err)
+		}
+	}
+
+	return nil
+}
+
+func (b *Bot) handleMessage(message *tgbotapi.Message) error {
+	// Handle reply commands first (including photo replies to issue comments)
+	if message.ReplyToMessage != nil {
+		return b.handleReplyMessage(message)
+	}
+
+	// Handle photo messages (only if not a reply)
+	if len(message.Photo) > 0 {
+		return b.handlePhotoMessage(message)
+	}
+
+	if message.Text == "" {
+		return fmt.Errorf("empty message received")
+	}
+
+	// Handle commands
+	if strings.HasPrefix(message.Text, "/") {
+		return b.handleCommand(message)
+	}
+
+	// Regular message - show file selection buttons
+	return b.showFileSelectionButtons(message)
+}
+
+func (b *Bot) handlePhotoMessage(message *tgbotapi.Message) error {
+	logger.Debug("Processing photo message from user", map[string]interface{}{
+		"username":    message.From.UserName,
+		"chat_id":     message.Chat.ID,
+		"photo_count": len(message.Photo),
+	})
+
+	// Ensure user exists in database if database is configured
+	_, err := b.ensureUser(message)
+	if err != nil {
+		return fmt.Errorf("failed to get user: %w", err)
+	}
+
+	// Get user-specific GitHub manager
+	userGitHubManager, err := b.getUserGitHubManager(message.Chat.ID)
+	if err != nil {
+		errorMsg := "❌ " + err.Error()
+		if b.db != nil {
+			errorMsg += ". " + consts.GitHubSetupPrompt
+		}
+		b.sendResponse(message.Chat.ID, errorMsg)
+		return nil
+	}
+
+	// Send status message with initial progress
+	statusMsg := "📷 Processing photo..."
+	statusMessageID := b.sendResponseAndGetMessageID(message.Chat.ID, statusMsg)
+
+	// Ensure repository exists with premium-aware setup (includes capacity checking)
+	premiumLevel := b.getPremiumLevel(message.Chat.ID)
+
+	// Show appropriate progress message based on whether repo needs cloning
+	if b.needsRepositoryClone(userGitHubManager) {
+		b.updateProgressMessage(message.Chat.ID, statusMessageID, 10, "📊 Checking remote repository size...")
+	} else {
+		b.updateProgressMessage(message.Chat.ID, statusMessageID, 10, "📊 Checking repository capacity...")
+	}
+
+	// Ensure repository with premium-aware cloning (includes size verification)
+	if err := userGitHubManager.EnsureRepositoryWithPremium(premiumLevel); err != nil {
+		logger.Error("Failed to ensure repository for photo upload", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": message.Chat.ID,
+		})
+
+		// Get user-friendly formatted error message
+		errorMsg := b.formatRepositorySetupError(err, "upload photos")
+
+		// Send formatted error message
+		editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, statusMessageID, errorMsg)
+		editMsg.ParseMode = "html"
+		if _, sendErr := b.rateLimitedSend(message.Chat.ID, editMsg); sendErr != nil {
+			logger.Error("Failed to edit message with formatted error", map[string]interface{}{
+				"error": sendErr.Error(),
+			})
+			// Fallback to simple message
+			b.editMessage(message.Chat.ID, statusMessageID, fmt.Sprintf("❌ Repository setup failed: %v", err))
+		}
+		return nil // Return nil instead of propagating the error to avoid duplicate messages
+	}
+
+	// Check repository capacity and image limits before uploading photo
+	// b.updateProgressMessage(message.Chat.ID, statusMessageID, 15, "📊 Checking limits...")
+
+	logger.Info("Checking repository capacity and image limits before photo upload", map[string]interface{}{
+		"premium_level": premiumLevel,
+		"chat_id":       message.Chat.ID,
+	})
+
+	// Check repository capacity
+	isNearCapacity, percentage, err := userGitHubManager.IsRepositoryNearCapacityWithPremium(premiumLevel)
+	if err != nil {
+		logger.Warn("Failed to check repository capacity before photo upload", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": message.Chat.ID,
+		})
+		// Continue anyway if capacity check fails - don't block upload
+	} else if isNearCapacity {
+		logger.Info("Photo upload blocked due to repository capacity", map[string]interface{}{
+			"percentage":    percentage,
+			"premium_level": premiumLevel,
+			"chat_id":       message.Chat.ID,
+		})
+
+		errorMsg := fmt.Sprintf(RepoPhotoUploadLimitTemplate, percentage)
+
+		editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, statusMessageID, errorMsg)
+		editMsg.ParseMode = "html"
+		if _, sendErr := b.rateLimitedSend(message.Chat.ID, editMsg); sendErr != nil {
+			logger.Error("Failed to edit message with capacity error", map[string]interface{}{
+				"error": sendErr.Error(),
+			})
+			// Fallback to simple message
+			b.editMessage(message.Chat.ID, statusMessageID, RepoCapacityLimitSimple)
+		}
+		return nil
+	}
+
+	// Check image upload limits
+	if b.db != nil {
+		canUpload, currentCount, imageLimit, err := b.db.CheckUsageImageLimit(message.Chat.ID, premiumLevel)
+		if err != nil {
+			logger.Warn("Failed to check image limit before photo upload", map[string]interface{}{
+				"error":   err.Error(),
+				"chat_id": message.Chat.ID,
+			})
+			// Continue anyway if image limit check fails - don't block upload
+		} else if !canUpload {
+			logger.Info("Photo upload blocked due to image limit", map[string]interface{}{
+				"current_count": currentCount,
+				"image_limit":   imageLimit,
+				"premium_level": premiumLevel,
+				"chat_id":       message.Chat.ID,
+			})
+
+			tierNames := map[int]string{0: "free", 1: "☕ Coffee", 2: "🍰 Cake", 3: "🎁 Sponsor"}
+			currentTier := tierNames[premiumLevel]
+
+			var upgradeHint string
+			if premiumLevel < 3 {
+				nextLimit := database.GetImageLimit(premiumLevel + 1)
+				nextTier := tierNames[premiumLevel+1]
+				upgradeHint = fmt.Sprintf("\n\n💡 <b>Upgrade to %s tier</b> to get <b>%d images</b> (%dx more)!", nextTier, nextLimit, database.GetImageMultiplier(premiumLevel+1))
+			} else {
+				upgradeHint = "\n\n🎉 You're already on the highest tier with maximum image limits!"
+			}
+
+			errorMsg := fmt.Sprintf(ImageLimitReachedDetailedTemplate, currentCount, imageLimit, currentTier, upgradeHint)
+
+			editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, statusMessageID, errorMsg)
+			editMsg.ParseMode = "html"
+			if _, sendErr := b.rateLimitedSend(message.Chat.ID, editMsg); sendErr != nil {
+				logger.Error("Failed to edit message with image limit error", map[string]interface{}{
+					"error": sendErr.Error(),
+				})
+				// Fallback to simple message
+				b.editMessage(message.Chat.ID, statusMessageID, fmt.Sprintf(ImageLimitReachedTemplate, currentCount, imageLimit))
+			}
+			return nil
+		}
+
+		logger.Info("Image limit check passed", map[string]interface{}{
+			"current_count": currentCount,
+			"image_limit":   imageLimit,
+			"premium_level": premiumLevel,
+			"chat_id":       message.Chat.ID,
+		})
+	}
+
+	logger.Info("All limits check passed, proceeding with photo upload", map[string]interface{}{
+		"repo_percentage": percentage,
+		"premium_level":   premiumLevel,
+		"chat_id":         message.Chat.ID,
+	})
+
+	// Continue with photo processing
+	b.updateProgressMessage(message.Chat.ID, statusMessageID, 20, "📷 Starting photo processing...")
+
+	// Get the largest photo (last in array)
+	photo := message.Photo[len(message.Photo)-1]
+
+	// Download the photo with progress
+	b.updateProgressMessage(message.Chat.ID, statusMessageID, 40, "⬇️ Downloading photo...")
+	photoData, filename, err := b.downloadPhoto(photo.FileID)
+	if err != nil {
+		logger.Error("Failed to download photo", map[string]interface{}{
+			"error":   err.Error(),
+			"file_id": photo.FileID,
+			"chat_id": message.Chat.ID,
+		})
+		b.editMessage(message.Chat.ID, statusMessageID, fmt.Sprintf("❌ Failed to download photo: %v", err))
+		return fmt.Errorf("failed to download photo: %w", err)
+	}
+
+	// Generate a unique filename with timestamp
+	timestamp := time.Now().Format("20060102_150405")
+	extension := filepath.Ext(filename)
+	if extension == "" {
+		extension = ".jpg" // Default extension
+	}
+	photoFilename := fmt.Sprintf("photo_%s%s", timestamp, extension)
+
+	// Upload photo to GitHub CDN with progress
+	b.updateProgressMessage(message.Chat.ID, statusMessageID, 70, "📝 Uploading photo to GitHub CDN...")
+
+	// Upload to GitHub CDN and get the URL
+	photoURL, err := userGitHubManager.UploadImageToCDN(photoFilename, photoData)
+	if err != nil {
+		logger.Error("Failed to upload photo to GitHub CDN", map[string]interface{}{
+			"error":    err.Error(),
+			"filename": photoFilename,
+			"size":     len(photoData),
+			"chat_id":  message.Chat.ID,
+		})
+		// Check if it's an authorization error and provide helpful message
+		if strings.Contains(err.Error(), "GitHub authorization failed") {
+			b.editMessage(message.Chat.ID, statusMessageID, "❌ "+err.Error())
+		} else {
+			b.editMessage(message.Chat.ID, statusMessageID, fmt.Sprintf("❌ Failed to upload photo: %v", err))
+		}
+		return fmt.Errorf("failed to upload photo to GitHub CDN: %w", err)
+	}
+
+	// Increment image count after successful photo upload
+	if b.db != nil {
+		if err := b.db.IncrementImageCount(message.Chat.ID); err != nil {
+			logger.Error("Failed to increment image count", map[string]interface{}{
+				"error":   err.Error(),
+				"chat_id": message.Chat.ID,
+			})
+		}
+		// Also increment usage count for current period tracking
+		if err := b.db.IncrementUsageImageCount(message.Chat.ID); err != nil {
+			logger.Error("Failed to increment usage image count", map[string]interface{}{
+				"error":   err.Error(),
+				"chat_id": message.Chat.ID,
+			})
+		}
+	}
+
+	// Show file selection buttons for both caption and no-caption photos with progress
+	b.updateProgressMessage(message.Chat.ID, statusMessageID, 90, "📋 Preparing file selection...")
+
+	logger.Info("Photo uploaded to CDN successfully, showing file selection buttons", map[string]interface{}{
+		"filename":    photoFilename,
+		"url":         photoURL,
+		"chat_id":     message.Chat.ID,
+		"has_caption": message.Caption != "",
+	})
+
+	if err := b.showFileSelectionButtonsForPhoto(message, photoURL, statusMessageID); err != nil {
+		logger.Error("Failed to show file selection buttons for photo", map[string]interface{}{
+			"error":   err.Error(),
+			"url":     photoURL,
+			"chat_id": message.Chat.ID,
+		})
+		b.editMessage(message.Chat.ID, statusMessageID, "❌ Failed to show photo options")
+		return fmt.Errorf("failed to show file selection buttons: %w", err)
+	}
+
+	logger.Info("File selection buttons sent successfully", map[string]interface{}{
+		"chat_id": message.Chat.ID,
+	})
+
+	// Don't show success message yet, wait for user selection
+	return nil
+}
+
+func (b *Bot) downloadPhoto(fileID string) ([]byte, string, error) {
+	// Get file info from Telegram
+	fileConfig := tgbotapi.FileConfig{FileID: fileID}
+	file, err := b.api.GetFile(fileConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Download the file
+	fileURL := file.Link(b.api.Token)
+	logger.Debug("Downloading photo from Telegram", map[string]interface{}{
+		"file_id":   fileID,
+		"file_url":  fileURL,
+		"file_size": file.FileSize,
+	})
+
+	resp, err := http.Get(fileURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("failed to download file: HTTP %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read file data: %w", err)
+	}
+
+	// Extract filename from the file path or use a default
+	filename := filepath.Base(file.FilePath)
+	if filename == "." || filename == "" {
+		filename = "photo.jpg"
+	}
+
+	logger.Debug("Photo downloaded successfully", map[string]interface{}{
+		"filename": filename,
+		"size":     len(data),
+	})
+
+	return data, filename, nil
+}
+
+func (b *Bot) handleReplyMessage(message *tgbotapi.Message) error {
+
+	if strings.HasPrefix(message.Text, "/edit ") {
+		return b.handleEditCommand(message)
+	}
+
+	if strings.TrimSpace(message.Text) == "/done" {
+		return b.handleDoneCommand(message)
+	}
+
+	// Check for custom file addition pending state first
+	stateKey := fmt.Sprintf("add_custom_%d", message.Chat.ID)
+	if stateData, exists := b.pendingMessages[stateKey]; exists {
+		// Remove the pending state and handle as custom file addition
+		delete(b.pendingMessages, stateKey)
+		return b.handleCustomFilePathReply(message, stateData)
+	}
+
+	// Check for issue comment pending state
+	commentStateKey := fmt.Sprintf("comment_%d_%d", message.Chat.ID, message.ReplyToMessage.MessageID)
+	if commentData, exists := b.pendingMessages[commentStateKey]; exists {
+		// Remove the pending state and handle as issue comment
+		delete(b.pendingMessages, commentStateKey)
+		return b.handleIssueCommentReply(message, commentData)
+	}
+
+	// Check if this is a reply to one of our command prompts
+	if message.ReplyToMessage != nil && message.ReplyToMessage.Text != "" {
+		replyText := message.ReplyToMessage.Text
+
+		if strings.Contains(replyText, "Set GitHub Repository") {
+			return b.handleSetRepoReply(message)
+		}
+
+		if strings.Contains(replyText, "Set GitHub Personal Access Token") {
+			return b.handleRepoTokenReply(message)
+		}
+
+		if strings.Contains(replyText, "Set LLM API Token") {
+			return b.handleLLMTokenReply(message)
+		}
+
+		if strings.Contains(replyText, "Custom Commit Author") {
+			return b.handleCommitterReply(message)
+		}
+	}
+
+	return fmt.Errorf("unknown reply command")
+}
+
+func (b *Bot) sendResponse(chatID int64, text string) {
+	logger.Debug("Sending response to chat", map[string]interface{}{
+		"chat_id": chatID,
+	})
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "html"
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send message", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	} else {
+		logger.Debug("Message sent successfully", map[string]interface{}{
+			"chat_id": chatID,
+		})
+	}
+}
+
+func (b *Bot) sendResponseAndGetMessageID(chatID int64, text string) int {
+	logger.Debug("Sending response to chat and getting message ID", map[string]interface{}{
+		"chat_id": chatID,
+	})
+	msg := tgbotapi.NewMessage(chatID, text)
+	response, err := b.rateLimitedSend(chatID, msg)
+	if err != nil {
+		logger.Error("Failed to send message", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return 0
+	}
+	logger.Debug("Message sent successfully", map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": response.MessageID,
+	})
+	return response.MessageID
+}
+
+func (b *Bot) editMessage(chatID int64, messageID int, text string) {
+	logger.Debug("Editing message", map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	})
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	if _, err := b.rateLimitedSend(chatID, edit); err != nil {
+		logger.Error("Failed to edit message", map[string]interface{}{
+			"error":      err.Error(),
+			"chat_id":    chatID,
+			"message_id": messageID,
+		})
+	} else {
+		logger.Debug("Message edited successfully", map[string]interface{}{
+			"chat_id":    chatID,
+			"message_id": messageID,
+		})
+	}
+}
+
+func (b *Bot) deleteMessage(chatID int64, messageID int) {
+	logger.Debug("Deleting message", map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": messageID,
+	})
+	delete := tgbotapi.NewDeleteMessage(chatID, messageID)
+	if _, err := b.rateLimitedSend(chatID, delete); err != nil {
+		logger.Error("Failed to delete message", map[string]interface{}{
+			"error":      err.Error(),
+			"chat_id":    chatID,
+			"message_id": messageID,
+		})
+	} else {
+		logger.Debug("Message deleted successfully", map[string]interface{}{
+			"chat_id":    chatID,
+			"message_id": messageID,
+		})
+	}
+}
+
+func (b *Bot) sendErrorResponse(chatID int64, err error) {
+	errorMsg := fmt.Sprintf("❌ Error: %v", err)
+	b.sendResponse(chatID, errorMsg)
+}
+
+// getUserGitHubManager gets or creates a GitHub manager for a specific user
+func (b *Bot) getUserGitHubManager(chatID int64) (*github.Manager, error) {
+	if b.db == nil {
+		return nil, fmt.Errorf("database is required for GitHub configuration")
+	}
+
+	// Get user from database
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+
+	if user == nil || !user.HasGitHubConfig() {
+		return nil, fmt.Errorf("user not configured or missing GitHub settings")
+	}
+
+	// Get premium level for the user
+	premiumLevel := b.getPremiumLevel(chatID)
+
+	// Create user-specific config with minimal required fields
+	userConfig := &config.Config{
+		GitHubToken:    user.GitHubToken,
+		GitHubRepo:     user.GitHubRepo,
+		GitHubUsername: b.config.GitHubUsername, // Use default from .env
+		CommitAuthor:   b.config.CommitAuthor,   // Use default from .env
+	}
+
+	return github.NewManager(userConfig, premiumLevel)
+}
+
+// getUserLLMClient gets or creates an LLM client for a specific user
+func (b *Bot) getUserLLMClient(chatID int64) *llm.Client {
+	if b.db == nil {
+		return nil // No database, no LLM client
+	}
+
+	// Get user from database
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		logger.Error("Failed to get user for LLM client", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return nil
+	}
+
+	if user == nil || !user.HasLLMConfig() {
+		return nil // No user or no LLM config
+	}
+
+	// Create user-specific config with user's token but default provider settings
+	userConfig := &config.Config{
+		LLMProvider: b.config.LLMProvider, // Use default from .env
+		LLMEndpoint: b.config.LLMEndpoint, // Use default from .env
+		LLMToken:    user.LLMToken,        // User-specific token
+		LLMModel:    b.config.LLMModel,    // Use default from .env
+	}
+
+	return llm.NewClient(userConfig)
+}
+
+// Rate limiting methods
+
+// getUserRateLimiter gets or creates a rate limiter for a specific user
+func (b *Bot) getUserRateLimiter(chatID int64) *rate.Limiter {
+	b.userLimitersMu.RLock()
+	limiter, exists := b.userLimiters[chatID]
+	b.userLimitersMu.RUnlock()
+
+	if !exists {
+		b.userLimitersMu.Lock()
+		// Double-check in case another goroutine created it
+		if limiter, exists = b.userLimiters[chatID]; !exists {
+			limiter = rate.NewLimiter(rate.Limit(30), 30) // 30 messages per second with burst of 30
+			b.userLimiters[chatID] = limiter
+
+			// Start cleanup goroutine only once
+			if !b.cleanupStarted {
+				b.cleanupStarted = true
+				go b.cleanupUserLimiters()
+			}
+		}
+		b.userLimitersMu.Unlock()
+	}
+
+	return limiter
+}
+
+// cleanupUserLimiters removes inactive user limiters to prevent memory leaks
+func (b *Bot) cleanupUserLimiters() {
+	ticker := time.NewTicker(10 * time.Minute) // Cleanup every 10 minutes
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.userLimitersMu.Lock()
+			// Remove limiters that haven't been used recently
+			// This is a simple approach - in production you might want more sophisticated cleanup
+			if len(b.userLimiters) > 1000 { // Only cleanup if we have many limiters
+				logger.Debug("Cleaning up user rate limiters", map[string]interface{}{
+					"limiter_count": len(b.userLimiters),
+				})
+				// Keep only the first 100 limiters (most recently created)
+				// This is a simple LRU-like approach
+				newLimiters := make(map[int64]*rate.Limiter)
+				count := 0
+				for chatID, limiter := range b.userLimiters {
+					if count < 100 {
+						newLimiters[chatID] = limiter
+						count++
+					}
+				}
+				b.userLimiters = newLimiters
+			}
+			b.userLimitersMu.Unlock()
+		}
+	}
+}
+
+// rateLimitedSend sends a message with rate limiting
+func (b *Bot) rateLimitedSend(chatID int64, msg tgbotapi.Chattable) (tgbotapi.Message, error) {
+	// Wait for global rate limiter
+	if err := b.globalLimiter.Wait(context.Background()); err != nil {
+		return tgbotapi.Message{}, fmt.Errorf("global rate limiter error: %w", err)
+	}
+
+	// Wait for user-specific rate limiter
+	userLimiter := b.getUserRateLimiter(chatID)
+	if err := userLimiter.Wait(context.Background()); err != nil {
+		return tgbotapi.Message{}, fmt.Errorf("user rate limiter error: %w", err)
+	}
+
+	logger.Debug("Sending rate-limited message", map[string]interface{}{
+		"chat_id": chatID,
+	})
+
+	return b.api.Send(msg)
+}
+
+// rateLimitedRequest sends a request with rate limiting
+func (b *Bot) rateLimitedRequest(chatID int64, req tgbotapi.CallbackConfig) (*tgbotapi.APIResponse, error) {
+	// Wait for global rate limiter
+	if err := b.globalLimiter.Wait(context.Background()); err != nil {
+		return nil, fmt.Errorf("global rate limiter error: %w", err)
+	}
+
+	// Wait for user-specific rate limiter
+	userLimiter := b.getUserRateLimiter(chatID)
+	if err := userLimiter.Wait(context.Background()); err != nil {
+		return nil, fmt.Errorf("user rate limiter error: %w", err)
+	}
+
+	logger.Debug("Sending rate-limited request", map[string]interface{}{
+		"chat_id": chatID,
+	})
+
+	return b.api.Request(req)
+}
+
+// showFileSelectionButtonsForPhoto shows file selection buttons for photos (with or without captions)
+func (b *Bot) showFileSelectionButtonsForPhoto(message *tgbotapi.Message, photoURL string, statusMessageID int) error {
+	logger.Debug("Showing file selection buttons for photo", nil)
+
+	// Handle both caption and no-caption scenarios
+	var markdownContent string
+	var promptText string
+
+	if message.Caption != "" {
+		// Convert caption to markdown format
+		markdownContent = b.telegramToMarkdown(message.Caption, message.CaptionEntities)
+		promptText = "Please choose where to save the photo with caption:"
+	} else {
+		// No caption, just create a simple photo reference
+		markdownContent = fmt.Sprintf("Photo: %s", photoURL)
+		promptText = "Please choose where to save the photo reference:"
+	}
+
+	// Store the formatted message content with photo URL for later use
+	messageKey := fmt.Sprintf("%d_%d", message.Chat.ID, message.MessageID)
+	messageData := fmt.Sprintf("%s|||DELIM|||%d|||DELIM|||%s", markdownContent, message.MessageID, photoURL)
+	b.pendingMessages[messageKey] = messageData
+
+	// Get user's pinned files
+	var pinnedFiles []string
+	if b.db != nil {
+		user, err := b.ensureUser(message)
+		if err == nil {
+			pinnedFiles = user.GetPinnedFiles()
+		}
+	}
+
+	// Build keyboard rows
+	var rows [][]tgbotapi.InlineKeyboardButton
+
+	// Add pinned files row if any exist
+	if len(pinnedFiles) > 0 {
+		pinnedRow := []tgbotapi.InlineKeyboardButton{}
+		for i, filePath := range pinnedFiles {
+			displayName := strings.TrimSuffix(filePath, ".md")
+			pinnedRow = append(pinnedRow, tgbotapi.NewInlineKeyboardButtonData(
+				fmt.Sprintf("📌 %s", displayName),
+				fmt.Sprintf("photo_PINNED_%d_%s", i, messageKey)))
+		}
+		rows = append(rows, pinnedRow)
+	}
+
+	// Create main file type options
+	row1 := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("📝 NOTE", fmt.Sprintf("photo_NOTE_%s", messageKey)),
+		tgbotapi.NewInlineKeyboardButtonData("❓ ISSUE", fmt.Sprintf("photo_ISSUE_%s", messageKey)),
+	)
+	// Only show TODO option if content doesn't contain line breaks (works for both caption and no-caption)
+	if !strings.Contains(markdownContent, "\n") {
+		row1 = append(row1, tgbotapi.NewInlineKeyboardButtonData("✅ TODO", fmt.Sprintf("photo_TODO_%s", messageKey)))
+	}
+
+	row2 := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("💡 IDEA", fmt.Sprintf("photo_IDEA_%s", messageKey)),
+		tgbotapi.NewInlineKeyboardButtonData("📥 INBOX", fmt.Sprintf("photo_INBOX_%s", messageKey)),
+		tgbotapi.NewInlineKeyboardButtonData("🔧 TOOL", fmt.Sprintf("photo_TOOL_%s", messageKey)),
+	)
+
+	row3 := tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("📁 CUSTOM", fmt.Sprintf("photo_CUSTOM_%s", messageKey)),
+		tgbotapi.NewInlineKeyboardButtonData("❌ CANCEL", fmt.Sprintf("cancel_%s", messageKey)),
+	)
+
+	rows = append(rows, row1, row2, row3)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
+
+	// Edit the existing status message to show the file selection buttons
+	editMsg := tgbotapi.NewEditMessageText(message.Chat.ID, statusMessageID, promptText)
+	editMsg.ReplyMarkup = &keyboard
+
+	if _, err := b.rateLimitedSend(message.Chat.ID, editMsg); err != nil {
+		return fmt.Errorf("failed to edit message with file selection buttons: %w", err)
+	}
+
+	return nil
+}
+
+// ensureUser ensures the user exists in the database
+func (b *Bot) ensureUser(message *tgbotapi.Message) (*database.User, error) {
+	if b.db == nil {
+		return nil, nil // No database configured
+	}
+
+	username := ""
+	if message.From != nil && message.From.UserName != "" {
+		username = message.From.UserName
+	}
+
+	// Use Chat.ID instead of From.ID for multi-user support
+	chatID := message.Chat.ID
+
+	return b.db.GetOrCreateUser(chatID, username)
+}
+
+// ensureUserFromCallback ensures the user exists in the database using callback data
+func (b *Bot) ensureUserFromCallback(callback *tgbotapi.CallbackQuery) (*database.User, error) {
+	if b.db == nil {
+		return nil, nil // No database configured
+	}
+
+	username := ""
+	if callback.From != nil && callback.From.UserName != "" {
+		username = callback.From.UserName
+	}
+
+	// Use Chat.ID from callback message
+	chatID := callback.Message.Chat.ID
+
+	return b.db.GetOrCreateUser(chatID, username)
+}
+
+// getCommitterInfo returns the committer string for a user (custom or env default)
+func (b *Bot) getCommitterInfo(chatID int64) string {
+	if b.db == nil {
+		// No database, use env default
+		return b.config.CommitAuthor
+	}
+
+	// Check if user has custom committer
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		logger.Warn("Failed to get user for committer info", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return b.config.CommitAuthor
+	}
+
+	if user != nil && user.Committer != "" {
+		return user.Committer
+	}
+
+	// Default to env committer
+	return b.config.CommitAuthor
+}
+
+// getPremiumLevel returns the premium level for a user (0 for free/expired users)
+func (b *Bot) getPremiumLevel(chatID int64) int {
+	if b.db == nil {
+		return 0 // No database, free tier
+	}
+
+	premiumUser, err := b.db.GetPremiumUser(chatID)
+	if err != nil {
+		logger.Warn("Failed to get premium user for level check", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return 0
+	}
+
+	if premiumUser != nil && premiumUser.IsPremiumUser() {
+		return premiumUser.Level
+	}
+
+	return 0 // Free tier
+}
+
+// needsRepositoryClone checks if the repository needs to be cloned (doesn't exist locally)
+func (b *Bot) needsRepositoryClone(githubManager *github.Manager) bool {
+	// This requires access to the GitHub manager's internal state
+	// We'll need to add a method to check if repository exists
+	return githubManager.NeedsClone()
+}
+
+// formatRepositorySetupError creates user-friendly error messages for repository setup failures
+func (b *Bot) formatRepositorySetupError(err error, context string) string {
+	errStr := err.Error()
+
+	// Check if it's a repository size limit error
+	if strings.Contains(errStr, "exceeds your tier limit") {
+		return fmt.Sprintf(`🚫 <b>Repository capacity exceeded</b>
+
+Cannot %s when repository exceeds size limits.
+
+Please:
+• Clean up your repository to free space
+• Use /coffee to upgrade to premium for higher limits
+• Use /insight to check current repository status
+
+<i>Note: You can still view existing content with commands like /todo and /issue</i>`, context)
+	} else if strings.Contains(errStr, "GitHub authorization failed") {
+		return fmt.Sprintf(`🔑 <b>GitHub authorization failed</b>
+
+Cannot access your repository to %s. Please:
+• Check your GitHub token with /repotoken command
+• Ensure the token has repository access permissions
+• Use /coffee if you need premium features
+
+<i>Contact support if the issue persists</i>`, context)
+	} else if strings.Contains(errStr, "repository not found") || strings.Contains(errStr, "404") {
+		return fmt.Sprintf(`📂 <b>Repository not found</b>
+
+Cannot find your repository to %s. Please:
+• Check your repository URL with /setrepo command
+• Ensure the repository exists and is accessible
+• Verify your GitHub token permissions
+
+<i>Use /insight to check your current setup</i>`, context)
+	} else {
+		// Generic repository setup error
+		return fmt.Sprintf(`⚠️ <b>Repository setup failed</b>
+
+Cannot set up repository to %s.
+
+Error: %v
+
+Please:
+• Use /insight to check your repository status
+• Use /coffee to upgrade to premium if needed
+• Contact support if the issue persists`, context, err)
+	}
+}
+
+
+
+	logger.Info("Processing reset usage payment", map[string]interface{}{
+		"user_id":    paymentData.UserID,
+		"amount":     paymentData.Amount,
+		"session_id": paymentData.SessionID,
+	})
+
+	// Validate payment amount for reset usage (should be exactly $2.99)
+	if paymentData.Amount != 2.99 {
+		logger.Warn("Invalid reset usage payment amount, skipping processing", map[string]interface{}{
+			"user_id":    paymentData.UserID,
+			"amount":     paymentData.Amount,
+			"expected":   2.99,
+			"session_id": paymentData.SessionID,
+		})
+		return
+	}
+
+	if b.db == nil {
+		logger.Error("Database not available for payment processing", map[string]interface{}{
+			"user_id": paymentData.UserID,
+		})
+		return
+	}
+
+	// Convert Telegram user ID to chat ID (they're the same for private chats)
+	chatID := paymentData.UserID
+
+	// Get user info for payment recording
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		logger.Error("Failed to get user for payment recording", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Check if user exists
+	if user == nil {
+		logger.Warn("Payment received for non-existent user, skipping processing", map[string]interface{}{
+			"chat_id":    chatID,
+			"session_id": paymentData.SessionID,
+			"amount":     paymentData.Amount,
+		})
+		return
+	}
+
+	// Get current usage before reset to log it
+	currentUsage, err := b.db.GetUserUsage(chatID)
+	if err != nil {
+		logger.Error("Failed to get current usage for reset log", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	var currentImages, currentIssues int64 = 0, 0
+	if currentUsage != nil {
+		currentImages = currentUsage.ImageCnt
+		currentIssues = currentUsage.IssueCnt
+	}
+
+	// Record the payment in database
+	topupLog, err := b.db.CreateTopupLog(chatID, user.Username, paymentData.Amount, consts.ServiceReset, paymentData.SessionID)
+	if err != nil {
+		logger.Error("Failed to record reset payment", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Create reset log entry
+	_, err = b.db.CreateResetLog(chatID, currentIssues, currentImages, topupLog.ID)
+	if err != nil {
+		logger.Error("Failed to create reset log", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Don't fail the reset for this, just log the error
+	}
+
+	// Reset usage statistics
+	if err := b.db.ResetUserUsage(chatID); err != nil {
+		logger.Error("Failed to reset user usage", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Increment reset count in user insights
+	if err := b.db.IncrementResetCount(chatID); err != nil {
+		logger.Error("Failed to increment reset count in insights", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Don't fail the reset for this, just log the error since the main operation succeeded
+	}
+
+	// Send success notification to user via Telegram
+	b.sendPaymentSuccessNotification(chatID, paymentData)
+
+	logger.Info("Usage reset completed successfully", map[string]interface{}{
+		"chat_id": chatID,
+		"amount":  paymentData.Amount,
+	})
+}
+
+// sendPaymentSuccessNotification sends a success message to the user after payment
+func (b *Bot) sendPaymentSuccessNotification(chatID int64, paymentData *stripe.PaymentData) {
+	successText := fmt.Sprintf(`✅ <b>Payment Successful!</b>
+
+<b>Amount Paid:</b> $%.2f
+<b>Transaction ID:</b> <code>%s</code>
+
+🚀 <b>Your usage limit has been reset!</b>
+
+You can now continue using premium features. Thank you for your payment!`,
+		paymentData.Amount, paymentData.SessionID)
+
+	msg := tgbotapi.NewMessage(chatID, successText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send payment success notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// processPremiumPayment processes premium tier payments and updates database
+func (b *Bot) processPremiumPayment(paymentData *stripe.PaymentData) {
+	logger.Info("Processing premium payment", map[string]interface{}{
+		"user_id":    paymentData.UserID,
+		"amount":     paymentData.Amount,
+		"session_id": paymentData.SessionID,
+	})
+
+	if b.db == nil {
+		logger.Error("Database not available for premium payment processing", map[string]interface{}{
+			"user_id": paymentData.UserID,
+		})
+		return
+	}
+
+	// Convert Telegram user ID to chat ID
+	chatID := paymentData.UserID
+
+	// Get user info for payment recording
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		logger.Error("Failed to get user for premium payment recording", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Check if user exists
+	if user == nil {
+		logger.Warn("Premium payment received for non-existent user, skipping processing", map[string]interface{}{
+			"chat_id":    chatID,
+			"session_id": paymentData.SessionID,
+			"amount":     paymentData.Amount,
+		})
+		return
+	}
+
+	// Extract premium level and tier name from Stripe metadata
+	premiumLevel := paymentData.PremiumLevel
+	tierName := paymentData.TierName
+	var serviceName string
+	
+	// If metadata is missing, determine from amount as fallback
+	if premiumLevel == 0 || tierName == "" {
+		switch paymentData.Amount {
+		case 5.0:
+			premiumLevel = consts.PremiumLevelCoffee
+			tierName = consts.TierCoffee
+			serviceName = consts.ServiceCoffee
+		case 15.0:
+			premiumLevel = consts.PremiumLevelCake
+			tierName = consts.TierCake
+			serviceName = consts.ServiceCake
+		case 50.0:
+			premiumLevel = consts.PremiumLevelSponsor
+			tierName = consts.TierSponsor
+			serviceName = consts.ServiceSponsor
+		default:
+			logger.Warn("Unknown premium payment amount", map[string]interface{}{
+				"amount":  paymentData.Amount,
+				"user_id": paymentData.UserID,
+			})
+			premiumLevel = consts.PremiumLevelCoffee // Default to Coffee
+			tierName = consts.TierCoffee
+			serviceName = consts.ServiceCoffee
+		}
+	} else {
+		// Map premium level to service name
+		switch premiumLevel {
+		case consts.PremiumLevelCoffee:
+			serviceName = consts.ServiceCoffee
+		case consts.PremiumLevelCake:
+			serviceName = consts.ServiceCake
+		case consts.PremiumLevelSponsor:
+			serviceName = consts.ServiceSponsor
+		default:
+			serviceName = consts.ServiceCoffee
+		}
+	}
+
+	// Set expiry time - all premium tiers now have 1 year expiry
+	expireAt := time.Now().AddDate(1, 0, 0).Unix() // 1 year expiry for all tiers
+
+	// Create or upgrade premium user
+	_, err = b.db.CreatePremiumUser(chatID, user.Username, premiumLevel, expireAt)
+	if err != nil {
+		logger.Error("Failed to create premium user", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Record the payment in database
+	_, err = b.db.CreateTopupLog(chatID, user.Username, paymentData.Amount, serviceName, paymentData.SessionID)
+	if err != nil {
+		logger.Error("Failed to record premium payment", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Send success notification to user
+	b.sendPremiumPaymentSuccessNotification(chatID, paymentData, tierName, premiumLevel)
+
+	logger.Info("Premium payment processed successfully", map[string]interface{}{
+		"chat_id":       chatID,
+		"amount":        paymentData.Amount,
+		"tier":          tierName,
+		"premium_level": premiumLevel,
+		"session_id":    paymentData.SessionID,
+	})
+}
+
+// processSubscriptionEvent processes subscription events (created, updated, deleted)
+func (b *Bot) processSubscriptionEvent(paymentData *stripe.PaymentData) {
+	logger.Info("Processing subscription event", map[string]interface{}{
+		"user_id":         paymentData.UserID,
+		"event_type":      paymentData.EventType,
+		"subscription_id": paymentData.SubscriptionID,
+		"tier_name":       paymentData.TierName,
+		"billing_period":  paymentData.BillingPeriod,
+	})
+
+	if b.db == nil {
+		logger.Error("Database not available for subscription event processing", map[string]interface{}{
+			"user_id": paymentData.UserID,
+		})
+		return
+	}
+
+	// Convert Telegram user ID to chat ID
+	chatID := paymentData.UserID
+
+	// Get user info
+	user, err := b.db.GetUserByChatID(chatID)
+	if err != nil {
+		logger.Error("Failed to get user for subscription event processing", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	if user == nil {
+		logger.Warn("Subscription event received for non-existent user, skipping processing", map[string]interface{}{
+			"chat_id":         chatID,
+			"subscription_id": paymentData.SubscriptionID,
+			"event_type":      paymentData.EventType,
+		})
+		return
+	}
+
+	// Prevent duplicate notifications during subscription creation flow
+	// When Stripe creates a subscription, it often fires multiple events (created + updated) rapidly
+	if paymentData.SubscriptionID != "" {
+		notificationCacheKey := fmt.Sprintf("subscription_notification_%s", paymentData.SubscriptionID)
+		
+		// For subscription creation, check if we've already sent a notification recently
+		if paymentData.EventType == "subscription_created" || paymentData.EventType == "checkout_completed" {
+			// Mark that we're sending a creation notification
+			b.cache.SetWithExpiry(notificationCacheKey, "creation_notified", 5*time.Minute)
+		} else if paymentData.EventType == "subscription_updated" || paymentData.EventType == "subscription_plan_or_reactivation" {
+			// Check if we just sent a creation notification for this subscription
+			if _, exists := b.cache.Get(notificationCacheKey); exists {
+				logger.Info("Skipping subscription update notification - creation notification already sent recently", map[string]interface{}{
+					"subscription_id": paymentData.SubscriptionID,
+					"event_type":      paymentData.EventType,
+					"chat_id":         chatID,
+				})
+				return
+			}
+		}
+		// Note: subscription_plan_upgrade events are NOT cached because they represent real charges
+		// that users should be notified about regardless of recent creation notifications
+	}
+
+	switch paymentData.EventType {
+	case "subscription_created", "checkout_completed":
+		b.processSubscriptionCreated(chatID, user, paymentData)
+	case "subscription_renewed":
+		b.processSubscriptionRenewed(chatID, user, paymentData)
+	case "subscription_deleted":
+		b.processSubscriptionCancelled(chatID, paymentData)
+	case "subscription_plan_changed":
+		b.processSubscriptionPlanChanged(chatID, user, paymentData)
+	case "subscription_plan_upgrade":
+		b.processSubscriptionPlanUpgrade(chatID, user, paymentData)
+	case "subscription_plan_or_reactivation":
+		b.processSubscriptionPlanOrReactivation(chatID, user, paymentData)
+	case "subscription_downgrade_scheduled":
+		b.processSubscriptionDowngradeScheduled(chatID, user, paymentData)
+	case "subscription_upgrade_scheduled":
+		b.processSubscriptionUpgradeScheduled(chatID, user, paymentData)
+	case "subscription_change_scheduled":
+		b.processSubscriptionChangeScheduled(chatID, user, paymentData)
+	case "subscription_cancel_scheduled":
+		b.processSubscriptionCancelScheduled(chatID, user, paymentData)
+	case "subscription_schedule_cancelled":
+		b.processSubscriptionScheduleCancelled(chatID, user, paymentData)
+	case "subscription_canceled":
+		b.processSubscriptionCancellation(chatID, user, paymentData)
+	case "subscription_reactivated":
+		b.processSubscriptionReactivated(chatID, user, paymentData)
+	case "subscription_updated":
+		b.processSubscriptionUpdated(chatID, user, paymentData)
+	case "subscription_past_due", "subscription_unpaid":
+		b.processSubscriptionPaymentIssue(chatID, user, paymentData)
+	default:
+		logger.Warn("Unknown subscription event type", map[string]interface{}{
+			"event_type": paymentData.EventType,
+			"user_id":    paymentData.UserID,
+		})
+	}
+}
+
+// processSubscriptionCreated handles new subscription creation
+func (b *Bot) processSubscriptionCreated(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Prevent duplicate processing of the same subscription event
+	if paymentData.SubscriptionID != "" {
+		cacheKey := fmt.Sprintf("subscription_processed_%s", paymentData.SubscriptionID)
+		if _, exists := b.cache.Get(cacheKey); exists {
+			logger.Info("Subscription event already processed recently, skipping", map[string]interface{}{
+				"subscription_id": paymentData.SubscriptionID,
+				"chat_id":         chatID,
+			})
+			return
+		}
+		// Mark this subscription as processed for 10 minutes
+		b.cache.SetWithExpiry(cacheKey, "processed", 10*time.Minute)
+	}
+
+	// Handle different event types appropriately
+	if paymentData.EventType == "checkout_completed" && paymentData.SubscriptionID == "" {
+		// Checkout completed but subscription not created yet - create basic premium user
+		// The subscription_created event will update with subscription details later
+		logger.Info("Processing checkout completion, subscription details will be updated later", map[string]interface{}{
+			"chat_id": chatID,
+			"tier":    paymentData.TierName,
+		})
+		
+		// Create basic premium user without subscription details for now
+		_, err := b.db.CreateSubscriptionPremiumUser(
+			chatID,
+			user.Username,
+			paymentData.PremiumLevel,
+			"", // Empty subscription ID for now
+			paymentData.CustomerID,
+			paymentData.BillingPeriod,
+		)
+		if err != nil {
+			logger.Error("Failed to create basic premium user", map[string]interface{}{
+				"error":   err.Error(),
+				"chat_id": chatID,
+			})
+		}
+		return // Don't send notification or log payment yet
+	}
+	
+	// Check if user already has an active premium subscription to avoid duplicate notifications
+	existingPremiumUser, err := b.db.GetPremiumUser(chatID)
+	if err != nil {
+		logger.Error("Failed to check existing premium user", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Continue anyway - don't fail the subscription creation
+	}
+	
+	// Determine if this is truly a new subscription or an update
+	isNewSubscription := true
+	if existingPremiumUser != nil && existingPremiumUser.IsPremiumUser() && existingPremiumUser.IsSubscription {
+		// User already has an active subscription - this might be a plan change or duplicate event
+		if existingPremiumUser.SubscriptionID != "" && existingPremiumUser.SubscriptionID != paymentData.SubscriptionID {
+			// Different subscription ID - this is a new subscription (old one was cancelled)
+			isNewSubscription = true
+		} else if existingPremiumUser.SubscriptionID == paymentData.SubscriptionID {
+			// Same subscription ID - this is likely a webhook retry or update, not a new subscription
+			isNewSubscription = false
+		} else {
+			// Existing user with no subscription ID - probably updating from checkout completion
+			isNewSubscription = false
+		}
+	}
+	
+	// This is a subscription_created event with actual subscription ID
+	// Create or update subscription-based premium user
+	_, err = b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to create/update subscription premium user", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Log subscription creation in topup_log
+	var serviceName string
+	var amount float64
+	
+	// Map premium level to service name
+	switch paymentData.PremiumLevel {
+	case consts.PremiumLevelCoffee:
+		serviceName = consts.ServiceCoffee
+	case consts.PremiumLevelCake:
+		serviceName = consts.ServiceCake
+	case consts.PremiumLevelSponsor:
+		serviceName = consts.ServiceSponsor
+	default:
+		serviceName = consts.ServiceCoffee
+	}
+	
+	// Use actual amount from Stripe if available, otherwise fallback to constants
+	if paymentData.Amount > 0 {
+		amount = paymentData.Amount
+	} else {
+		// Fallback to hardcoded amounts if Stripe amount is not available
+		switch paymentData.PremiumLevel {
+		case consts.PremiumLevelCoffee:
+			if paymentData.BillingPeriod == "annually" {
+				amount = consts.PriceCoffee * 12
+			} else {
+				amount = consts.PriceCoffee
+			}
+		case consts.PremiumLevelCake:
+			if paymentData.BillingPeriod == "annually" {
+				amount = consts.PriceCake * 12
+			} else {
+				amount = consts.PriceCake
+			}
+		case consts.PremiumLevelSponsor:
+			if paymentData.BillingPeriod == "annually" {
+				amount = consts.PriceSponsor * 12
+			} else {
+				amount = consts.PriceSponsor
+			}
+		default:
+			amount = consts.PriceCoffee
+		}
+	}
+	
+	// Create topup log entry for subscription
+	_, err = b.db.CreateTopupLog(
+		chatID,
+		user.Username,
+		amount,
+		serviceName,
+		paymentData.SubscriptionID, // Use subscription ID as transaction ID
+	)
+	if err != nil {
+		logger.Error("Failed to create subscription topup log", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Don't return here - subscription creation was successful, just logging failed
+	}
+
+	// Only send success notification for truly new subscriptions
+	if isNewSubscription {
+		b.sendSubscriptionSuccessNotification(chatID, paymentData)
+		logger.Info("New subscription created successfully", map[string]interface{}{
+			"chat_id":         chatID,
+			"subscription_id": paymentData.SubscriptionID,
+			"tier":            paymentData.TierName,
+			"premium_level":   paymentData.PremiumLevel,
+			"billing_period":  paymentData.BillingPeriod,
+			"amount":          amount,
+			"service":         serviceName,
+		})
+	} else {
+		logger.Info("Subscription updated (no notification sent)", map[string]interface{}{
+			"chat_id":         chatID,
+			"subscription_id": paymentData.SubscriptionID,
+			"tier":            paymentData.TierName,
+			"premium_level":   paymentData.PremiumLevel,
+			"billing_period":  paymentData.BillingPeriod,
+			"reason":          "existing subscription or duplicate event",
+		})
+	}
+}
+
+// processSubscriptionRenewed handles subscription renewal (invoice.payment_succeeded)
+func (b *Bot) processSubscriptionRenewed(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Extend subscription expiry date
+	err := b.db.RenewSubscriptionPremiumUser(chatID, paymentData.BillingPeriod)
+	if err != nil {
+		logger.Error("Failed to renew subscription premium user", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Log subscription renewal in topup_log
+	var serviceName string
+	var amount = paymentData.Amount // Amount comes from Stripe invoice
+	
+	// Map premium level to service name
+	switch paymentData.PremiumLevel {
+	case consts.PremiumLevelCoffee:
+		serviceName = consts.ServiceCoffee
+	case consts.PremiumLevelCake:
+		serviceName = consts.ServiceCake
+	case consts.PremiumLevelSponsor:
+		serviceName = consts.ServiceSponsor
+	default:
+		serviceName = consts.ServiceCoffee
+	}
+	
+	// Create topup log entry for subscription renewal
+	_, err = b.db.CreateTopupLog(
+		chatID,
+		user.Username,
+		amount,
+		serviceName,
+		paymentData.SubscriptionID, // Use subscription ID as transaction ID
+	)
+	if err != nil {
+		logger.Error("Failed to create subscription renewal topup log", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Don't return here - renewal was successful, just logging failed
+	}
+
+	// Send renewal notification to user (optional - you might not want to spam users)
+	b.sendSubscriptionRenewalNotification(chatID, paymentData)
+
+	logger.Info("Subscription renewed successfully", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"tier":            paymentData.TierName,
+		"premium_level":   paymentData.PremiumLevel,
+		"billing_period":  paymentData.BillingPeriod,
+		"amount":          amount,
+		"service":         serviceName,
+	})
+}
+
+// processSubscriptionCancelled handles subscription cancellation
+func (b *Bot) processSubscriptionCancelled(chatID int64, paymentData *stripe.PaymentData) {
+	err := b.db.CancelSubscriptionPremiumUser(chatID)
+	if err != nil {
+		logger.Error("Failed to cancel subscription premium user", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Send cancellation notification to user
+	b.sendSubscriptionCancelledNotification(chatID, paymentData)
+
+	logger.Info("Subscription cancelled successfully", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+	})
+}
+
+// sendSubscriptionSuccessNotification sends a success message for new subscriptions
+func (b *Bot) sendSubscriptionSuccessNotification(chatID int64, paymentData *stripe.PaymentData) {
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	successText := fmt.Sprintf(`🎉 <b>Subscription Activated!</b>
+
+<b>Tier:</b> %s
+<b>Billing:</b> %s
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Benefits Unlocked:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+✨ Automatic renewal (%s)
+
+<i>Thank you for supporting the project! 🙏</i>
+
+Use /insight to see your new limits!
+Use /coffee to manage your subscription.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod), 
+		paymentData.SubscriptionID, multiplier, paymentData.BillingPeriod)
+
+	msg := tgbotapi.NewMessage(chatID, successText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send subscription success notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionCancelledNotification sends a cancellation message
+func (b *Bot) sendSubscriptionCancelledNotification(chatID int64, paymentData *stripe.PaymentData) {
+	cancelText := fmt.Sprintf(`😢 <b>Subscription Cancelled</b>
+
+Your premium subscription has been cancelled.
+
+<b>Subscription ID:</b> <code>%s</code>
+
+You'll continue to have access to premium features until the end of your current billing period. After that, your account will revert to the free tier.
+
+<i>Thank you for your support! You can resubscribe anytime using /coffee.</i>`, 
+		paymentData.SubscriptionID)
+
+	msg := tgbotapi.NewMessage(chatID, cancelText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send subscription cancelled notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionRenewalNotification sends a renewal notification (optional)
+func (b *Bot) sendSubscriptionRenewalNotification(chatID int64, paymentData *stripe.PaymentData) {
+	renewalText := fmt.Sprintf(`🔄 <b>Subscription Renewed</b>
+
+Your %s subscription has been automatically renewed.
+
+<b>Billing Details:</b>
+• Amount: $%.2f
+• Period: %s
+• Next billing: %s
+
+<i>Your premium features continue without interruption. Thank you for your continued support! 🙏</i>`, 
+		paymentData.TierName, 
+		paymentData.Amount, 
+		strings.Title(paymentData.BillingPeriod),
+		func() string {
+			if paymentData.BillingPeriod == "monthly" {
+				return time.Now().AddDate(0, 1, 0).Format("2006-01-02")
+			} else {
+				return time.Now().AddDate(1, 0, 0).Format("2006-01-02")
+			}
+		}())
+
+	msg := tgbotapi.NewMessage(chatID, renewalText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send subscription renewal notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendPremiumPaymentSuccessNotification sends a success message for premium payments
+func (b *Bot) sendPremiumPaymentSuccessNotification(chatID int64, paymentData *stripe.PaymentData, tierName string, premiumLevel int) {
+	multiplier := getRepositoryMultiplier(premiumLevel)
+	
+	successText := fmt.Sprintf(`🎉 <b>Premium Activated!</b>
+
+<b>Tier:</b> %s
+<b>Amount:</b> $%.2f
+<b>Transaction ID:</b> <code>%s</code>
+
+<b>Benefits Unlocked:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Thank you for supporting the project! 🙏</i>
+
+Use /insight to see your new limits!`, 
+		tierName, paymentData.Amount, paymentData.SessionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, successText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send premium payment success notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// processSubscriptionPlanChanged handles subscription plan changes (tier or billing period changes)
+func (b *Bot) processSubscriptionPlanChanged(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Update premium user with new plan details
+	_, err := b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to update premium user for plan change", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Send plan change notification
+	b.sendSubscriptionPlanChangeNotification(chatID, paymentData)
+
+	logger.Info("Subscription plan changed", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"new_tier":        paymentData.TierName,
+		"new_billing":     paymentData.BillingPeriod,
+	})
+}
+
+// processSubscriptionPlanUpgrade handles immediate plan upgrades with prorated charges
+func (b *Bot) processSubscriptionPlanUpgrade(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Update premium user with new plan details from the subscription.updated event
+	// The invoice.payment_succeeded event gives us the prorated amount
+	_, err := b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to update premium user for plan upgrade", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Log the prorated upgrade charge in topup_log
+	var serviceName string
+	switch paymentData.PremiumLevel {
+	case consts.PremiumLevelCoffee:
+		serviceName = consts.ServiceCoffee
+	case consts.PremiumLevelCake:
+		serviceName = consts.ServiceCake
+	case consts.PremiumLevelSponsor:
+		serviceName = consts.ServiceSponsor
+	default:
+		serviceName = consts.ServiceCoffee
+	}
+	
+	// Create topup log entry for the prorated upgrade charge
+	_, err = b.db.CreateTopupLog(
+		chatID,
+		user.Username,
+		paymentData.Amount, // Actual prorated amount from Stripe
+		serviceName,
+		paymentData.SubscriptionID,
+	)
+	if err != nil {
+		logger.Error("Failed to create plan upgrade topup log", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		// Don't return here - upgrade was successful, just logging failed
+	}
+
+	// Send plan upgrade notification
+	b.sendSubscriptionPlanUpgradeNotification(chatID, paymentData)
+
+	logger.Info("Subscription plan upgraded with prorated charge", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"new_tier":        paymentData.TierName,
+		"prorated_amount": paymentData.Amount,
+	})
+}
+
+// processSubscriptionCancelScheduled handles when user schedules cancellation (cancel_at_period_end = true)
+func (b *Bot) processSubscriptionCancelScheduled(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Don't revoke access - subscription remains active until period end
+	// Send cancellation scheduled notification
+	b.sendSubscriptionCancelScheduledNotification(chatID, paymentData)
+
+	logger.Info("Subscription cancellation scheduled by user", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+	})
+}
+
+// processSubscriptionCancellation handles immediate subscription cancellation (status = canceled)
+func (b *Bot) processSubscriptionCancellation(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// This is immediate cancellation - access should be revoked
+	// Send immediate cancellation notification
+	b.sendSubscriptionImmediateCancellationNotification(chatID, paymentData)
+
+	logger.Info("Subscription cancelled immediately", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+	})
+}
+
+// processSubscriptionScheduleCancelled handles when a scheduled plan change (upgrade/downgrade) is cancelled
+func (b *Bot) processSubscriptionScheduleCancelled(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Send schedule cancellation notification
+	b.sendSubscriptionScheduleCancelledNotification(chatID, paymentData)
+
+	logger.Info("Subscription schedule cancelled", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"tier_name":       paymentData.TierName,
+	})
+}
+
+// processSubscriptionReactivated handles subscription reactivation (cancel_at_period_end set back to false)
+func (b *Bot) processSubscriptionReactivated(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Update premium user to ensure subscription continues
+	_, err := b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to update premium user for reactivation", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Send reactivation notification
+	b.sendSubscriptionReactivatedNotification(chatID, paymentData)
+
+	logger.Info("Subscription reactivated", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+	})
+}
+
+// processSubscriptionPlanOrReactivation handles cases where we need to determine if it's a plan change or reactivation
+func (b *Bot) processSubscriptionPlanOrReactivation(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	logger.Debug("Processing subscription plan or reactivation", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"incoming_tier":   paymentData.TierName,
+		"incoming_level":  paymentData.PremiumLevel,
+		"billing_period":  paymentData.BillingPeriod,
+	})
+
+	// Get current premium user data BEFORE updating to detect downgrades
+	var currentPremiumLevel int
+	var currentBillingPeriod string
+	var currentTierName string
+	currentPremiumUser, err := b.db.GetPremiumUser(chatID)
+	if err == nil && currentPremiumUser != nil && currentPremiumUser.IsPremiumUser() {
+		currentPremiumLevel = currentPremiumUser.Level
+		currentBillingPeriod = currentPremiumUser.BillingPeriod
+		
+		tierNames := []string{"Free", "☕ Coffee", "🍰 Cake", "🎁 Sponsor"}
+		if currentPremiumLevel < len(tierNames) {
+			currentTierName = tierNames[currentPremiumLevel]
+		}
+		
+		logger.Debug("Found existing premium user", map[string]interface{}{
+			"current_tier":    currentTierName,
+			"current_level":   currentPremiumLevel,
+			"current_billing": currentBillingPeriod,
+			"subscription_id": currentPremiumUser.SubscriptionID,
+		})
+	} else {
+		logger.Debug("No existing premium user found or user not premium", map[string]interface{}{
+			"error":     err,
+			"user_nil":  currentPremiumUser == nil,
+			"is_premium": func() bool { 
+				if currentPremiumUser != nil { 
+					return currentPremiumUser.IsPremiumUser() 
+				}
+				return false 
+			}(),
+		})
+	}
+
+	// Update premium user with new details
+	_, err = b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to update premium user for plan/reactivation", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	// Determine the type of change and send appropriate notification
+	var notificationType string
+	if currentPremiumLevel > 0 && currentPremiumLevel > paymentData.PremiumLevel {
+		// This is a downgrade - send specialized downgrade notification
+		notificationType = "DOWNGRADE"
+		logger.Debug("Detected plan DOWNGRADE", map[string]interface{}{
+			"from_tier":  currentTierName,
+			"from_level": currentPremiumLevel,
+			"to_tier":    paymentData.TierName,
+			"to_level":   paymentData.PremiumLevel,
+		})
+		b.sendSubscriptionDowngradeNotification(chatID, paymentData, currentPremiumLevel, currentBillingPeriod)
+	} else if currentPremiumLevel > 0 && currentPremiumLevel < paymentData.PremiumLevel {
+		// This is an upgrade - send specialized upgrade notification
+		notificationType = "UPGRADE"
+		logger.Debug("Detected plan UPGRADE", map[string]interface{}{
+			"from_tier":  currentTierName,
+			"from_level": currentPremiumLevel,
+			"to_tier":    paymentData.TierName,
+			"to_level":   paymentData.PremiumLevel,
+		})
+		b.sendSubscriptionPlanChangeNotification(chatID, paymentData)
+	} else {
+		// Regular update or reactivation - send standard update notification
+		notificationType = "UPDATE_OR_REACTIVATION"
+		logger.Debug("Detected plan UPDATE or REACTIVATION", map[string]interface{}{
+			"current_level": currentPremiumLevel,
+			"new_level":     paymentData.PremiumLevel,
+			"same_level":    currentPremiumLevel == paymentData.PremiumLevel,
+		})
+		b.sendSubscriptionUpdateNotification(chatID, paymentData)
+	}
+
+	logger.Info("Subscription updated (plan change or reactivation)", map[string]interface{}{
+		"chat_id":           chatID,
+		"subscription_id":   paymentData.SubscriptionID,
+		"tier":              paymentData.TierName,
+		"notification_type": notificationType,
+		"current_level":     currentPremiumLevel,
+		"new_level":         paymentData.PremiumLevel,
+	})
+}
+
+// processSubscriptionUpdated handles general subscription updates (reactivations, etc.)
+func (b *Bot) processSubscriptionUpdated(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Update premium user details in case anything changed
+	_, err := b.db.CreateSubscriptionPremiumUser(
+		chatID,
+		user.Username,
+		paymentData.PremiumLevel,
+		paymentData.SubscriptionID,
+		paymentData.CustomerID,
+		paymentData.BillingPeriod,
+	)
+	if err != nil {
+		logger.Error("Failed to update premium user for subscription update", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+		return
+	}
+
+	logger.Info("Subscription updated", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"tier":            paymentData.TierName,
+	})
+}
+
+// processSubscriptionDowngradeScheduled handles scheduled plan downgrades
+func (b *Bot) processSubscriptionDowngradeScheduled(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	logger.Info("Processing scheduled subscription downgrade", map[string]interface{}{
+		"chat_id":              chatID,
+		"current_tier":         paymentData.TierName,
+		"current_level":        paymentData.PremiumLevel,
+		"future_tier":          paymentData.FutureTierName,
+		"future_level":         paymentData.FuturePremiumLevel,
+		"scheduled_change_date": paymentData.ScheduledChangeDate,
+	})
+
+	// Send the enhanced downgrade notification with future plan info
+	b.sendScheduledDowngradeNotification(chatID, paymentData)
+
+	logger.Info("Scheduled subscription downgrade processed", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"current_tier":    paymentData.TierName,
+		"future_tier":     paymentData.FutureTierName,
+	})
+}
+
+// processSubscriptionUpgradeScheduled handles scheduled plan upgrades
+func (b *Bot) processSubscriptionUpgradeScheduled(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	logger.Info("Processing scheduled subscription upgrade", map[string]interface{}{
+		"chat_id":              chatID,
+		"current_tier":         paymentData.TierName,
+		"current_level":        paymentData.PremiumLevel,
+		"future_tier":          paymentData.FutureTierName,
+		"future_level":         paymentData.FuturePremiumLevel,
+		"scheduled_change_date": paymentData.ScheduledChangeDate,
+	})
+
+	// Send the enhanced upgrade notification with future plan info
+	b.sendScheduledUpgradeNotification(chatID, paymentData)
+
+	logger.Info("Scheduled subscription upgrade processed", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"current_tier":    paymentData.TierName,
+		"future_tier":     paymentData.FutureTierName,
+	})
+}
+
+// processSubscriptionChangeScheduled handles other scheduled plan changes
+func (b *Bot) processSubscriptionChangeScheduled(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	logger.Info("Processing scheduled subscription change", map[string]interface{}{
+		"chat_id":              chatID,
+		"current_tier":         paymentData.TierName,
+		"current_level":        paymentData.PremiumLevel,
+		"future_tier":          paymentData.FutureTierName,
+		"future_level":         paymentData.FuturePremiumLevel,
+		"scheduled_change_date": paymentData.ScheduledChangeDate,
+	})
+
+	// Send the enhanced change notification with future plan info
+	b.sendScheduledChangeNotification(chatID, paymentData)
+
+	logger.Info("Scheduled subscription change processed", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"current_tier":    paymentData.TierName,
+		"future_tier":     paymentData.FutureTierName,
+	})
+}
+
+// processSubscriptionPaymentIssue handles subscription payment problems (past_due, unpaid)
+func (b *Bot) processSubscriptionPaymentIssue(chatID int64, user *database.User, paymentData *stripe.PaymentData) {
+	// Don't revoke access immediately - give user time to resolve payment issues
+	// Send payment issue notification
+	b.sendSubscriptionPaymentIssueNotification(chatID, paymentData)
+
+	logger.Warn("Subscription payment issue", map[string]interface{}{
+		"chat_id":         chatID,
+		"subscription_id": paymentData.SubscriptionID,
+		"event_type":      paymentData.EventType,
+	})
+}
+
+// sendSubscriptionPlanChangeNotification sends notification for plan changes
+func (b *Bot) sendSubscriptionPlanChangeNotification(chatID int64, paymentData *stripe.PaymentData) {
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	changeText := fmt.Sprintf(`🔄 <b>Subscription Plan Changed</b>
+
+<b>New Plan:</b> %s (%s)
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Updated Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your new plan benefits are now active! 🚀</i>
+
+Use /insight to see your updated limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod), 
+		paymentData.SubscriptionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, changeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send plan change notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionPlanUpgradeNotification sends notification for immediate plan upgrades with prorated charges
+func (b *Bot) sendSubscriptionPlanUpgradeNotification(chatID int64, paymentData *stripe.PaymentData) {
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	upgradeText := fmt.Sprintf(`🎉 <b>Plan Upgraded Successfully!</b>
+
+<b>New Plan:</b> %s (%s)
+<b>Prorated Charge:</b> $%.2f
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Upgraded Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your upgraded plan benefits are now active! The prorated charge covers the remaining billing period. 🚀</i>
+
+Use /insight to see your updated limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod), 
+		paymentData.Amount, paymentData.SubscriptionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, upgradeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send plan upgrade notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionCancelScheduledNotification sends notification for scheduled cancellation (cancel_at_period_end)
+func (b *Bot) sendSubscriptionCancelScheduledNotification(chatID int64, paymentData *stripe.PaymentData) {
+	cancelText := fmt.Sprintf(`⚠️ <b>Subscription Cancellation Scheduled</b>
+
+Your subscription has been set to cancel at the end of the current billing period.
+
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>What happens next:</b>
+• You'll keep premium access until your billing period ends
+• No further charges will be made
+• You can reactivate anytime before the period ends
+
+<i>Want to reactivate? Use /coffee and manage your subscription through the Customer Portal.</i>`, 
+		paymentData.SubscriptionID)
+
+	msg := tgbotapi.NewMessage(chatID, cancelText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send scheduled cancellation notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionImmediateCancellationNotification sends notification for immediate cancellation
+func (b *Bot) sendSubscriptionImmediateCancellationNotification(chatID int64, paymentData *stripe.PaymentData) {
+	cancelText := fmt.Sprintf(`❌ <b>Subscription Cancelled</b>
+
+Your subscription has been cancelled and access has been revoked immediately.
+
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>What happened:</b>
+• Premium access has been removed
+• No further charges will be made
+• You can subscribe again anytime using /coffee
+
+<i>Thank you for your past support! 🙏</i>`, 
+		paymentData.SubscriptionID)
+
+	msg := tgbotapi.NewMessage(chatID, cancelText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send immediate cancellation notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionReactivatedNotification sends notification for subscription reactivation
+func (b *Bot) sendSubscriptionReactivatedNotification(chatID int64, paymentData *stripe.PaymentData) {
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	reactivateText := fmt.Sprintf(`🎉 <b>Subscription Reactivated!</b>
+
+Great news! Your subscription has been reactivated and will continue automatically.
+
+<b>Plan:</b> %s (%s)
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Your Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+✨ Automatic renewal continues
+
+<i>Welcome back! Your premium features are active again. 🚀</i>
+
+Use /insight to see your limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.SubscriptionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, reactivateText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send reactivation notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionScheduleCancelledNotification sends notification when a scheduled plan change is cancelled
+func (b *Bot) sendSubscriptionScheduleCancelledNotification(chatID int64, paymentData *stripe.PaymentData) {
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	cancelText := fmt.Sprintf(`✅ <b>Scheduled Plan Change Cancelled</b>
+
+Your scheduled plan change has been successfully cancelled.
+
+<b>Current Plan:</b> %s (%s) - Continues unchanged
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Your Current Benefits Continue:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+✨ Automatic renewal
+
+<i>No changes will occur to your subscription. Your current plan remains active. 🎯</i>
+
+Use /insight to see your current limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.SubscriptionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, cancelText)
+	msg.ParseMode = "HTML"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send schedule cancellation notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionUpdateNotification sends notification for general subscription updates
+func (b *Bot) sendSubscriptionUpdateNotification(chatID int64, paymentData *stripe.PaymentData) {
+	logger.Debug("Sending standard update notification", map[string]interface{}{
+		"chat_id":        chatID,
+		"premium_level":  paymentData.PremiumLevel,
+		"tier_name":      paymentData.TierName,
+		"billing_period": paymentData.BillingPeriod,
+	})
+
+	multiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	updateText := fmt.Sprintf(`🔄 <b>Subscription Updated</b>
+
+Your subscription has been updated successfully.
+
+<b>Current Plan:</b> %s (%s)
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Active Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your subscription continues with updated settings. 📝</i>
+
+Use /insight to see your current limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.SubscriptionID, multiplier)
+
+	msg := tgbotapi.NewMessage(chatID, updateText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send subscription update notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionDowngradeNotification sends notification for plan downgrades scheduled for end of billing period
+func (b *Bot) sendSubscriptionDowngradeNotification(chatID int64, paymentData *stripe.PaymentData, currentPremiumLevel int, currentBillingPeriod string) {
+	logger.Debug("Sending downgrade notification", map[string]interface{}{
+		"chat_id":              chatID,
+		"current_premium_level": currentPremiumLevel,
+		"new_premium_level":     paymentData.PremiumLevel,
+		"current_billing":       currentBillingPeriod,
+		"new_billing":           paymentData.BillingPeriod,
+	})
+
+	// Get tier names for current and future plans
+	tierNames := []string{"Free", "☕ Coffee", "🍰 Cake", "🎁 Sponsor"}
+	currentTierName := "Premium"
+	if currentPremiumLevel < len(tierNames) {
+		currentTierName = tierNames[currentPremiumLevel]
+	}
+	
+	currentMultiplier := getRepositoryMultiplier(currentPremiumLevel)
+	futureMultiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	
+	downgradeText := fmt.Sprintf(`🔄 <b>Subscription Plan Downgrade Scheduled</b>
+
+Your subscription plan will be downgraded at the end of your current billing period.
+
+<b>Current Plan:</b> %s (%s) - <i>Active until period ends</i>
+<b>Next Plan:</b> %s (%s) - <i>Takes effect at renewal</i>
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Current Active Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<b>Benefits After Downgrade:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your current plan benefits remain active until the end of this billing period. The downgrade will take effect at your next renewal date. 📝</i>
+
+Use /insight to see your current limits.`, 
+		currentTierName, strings.Title(currentBillingPeriod),
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.SubscriptionID, 
+		currentMultiplier,
+		futureMultiplier)
+
+	msg := tgbotapi.NewMessage(chatID, downgradeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send subscription downgrade notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendScheduledDowngradeNotification sends notification for scheduled plan downgrades with future plan info
+func (b *Bot) sendScheduledDowngradeNotification(chatID int64, paymentData *stripe.PaymentData) {
+	logger.Info("Sending scheduled downgrade notification", map[string]interface{}{
+		"chat_id":       chatID,
+		"current_tier":  paymentData.TierName,
+		"current_level": paymentData.PremiumLevel,
+		"future_tier":   paymentData.FutureTierName,
+		"future_level":  paymentData.FuturePremiumLevel,
+	})
+
+	currentMultiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	futureMultiplier := getRepositoryMultiplier(paymentData.FuturePremiumLevel)
+	
+	// Format the scheduled change date
+	changeDate := time.Unix(paymentData.ScheduledChangeDate, 0).Format("2006-01-02")
+	
+	downgradeText := fmt.Sprintf(`🔄 <b>Subscription Plan Downgrade Scheduled</b>
+
+Your subscription plan will be downgraded at the end of your current billing period.
+
+<b>Current Plan:</b> %s (%s) - <i>Active until period ends</i>
+<b>Next Plan:</b> %s (%s) - <i>Takes effect %s</i>
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Current Active Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<b>Benefits After Downgrade:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your current plan benefits remain active until the end of this billing period. The downgrade will take effect on %s. 📝</i>
+
+Use /insight to see your current limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.FutureTierName, strings.Title(paymentData.FutureBillingPeriod),
+		changeDate,
+		paymentData.SubscriptionID, 
+		currentMultiplier,
+		futureMultiplier,
+		changeDate)
+
+	msg := tgbotapi.NewMessage(chatID, downgradeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send scheduled downgrade notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendScheduledUpgradeNotification sends notification for scheduled plan upgrades with future plan info
+func (b *Bot) sendScheduledUpgradeNotification(chatID int64, paymentData *stripe.PaymentData) {
+	logger.Info("Sending scheduled upgrade notification", map[string]interface{}{
+		"chat_id":       chatID,
+		"current_tier":  paymentData.TierName,
+		"current_level": paymentData.PremiumLevel,
+		"future_tier":   paymentData.FutureTierName,
+		"future_level":  paymentData.FuturePremiumLevel,
+	})
+
+	currentMultiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	futureMultiplier := getRepositoryMultiplier(paymentData.FuturePremiumLevel)
+	
+	// Format the scheduled change date
+	changeDate := time.Unix(paymentData.ScheduledChangeDate, 0).Format("2006-01-02")
+	
+	upgradeText := fmt.Sprintf(`🎉 <b>Subscription Plan Upgrade Scheduled</b>
+
+Your subscription plan will be upgraded at the end of your current billing period.
+
+<b>Current Plan:</b> %s (%s) - <i>Active until period ends</i>
+<b>Next Plan:</b> %s (%s) - <i>Takes effect %s</i>
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Current Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<b>Enhanced Benefits After Upgrade:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your current plan remains active until the end of this billing period. The upgrade will take effect on %s. 🚀</i>
+
+Use /insight to see your current limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.FutureTierName, strings.Title(paymentData.FutureBillingPeriod),
+		changeDate,
+		paymentData.SubscriptionID, 
+		currentMultiplier,
+		futureMultiplier,
+		changeDate)
+
+	msg := tgbotapi.NewMessage(chatID, upgradeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send scheduled upgrade notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendScheduledChangeNotification sends notification for other scheduled plan changes
+func (b *Bot) sendScheduledChangeNotification(chatID int64, paymentData *stripe.PaymentData) {
+	logger.Info("Sending scheduled change notification", map[string]interface{}{
+		"chat_id":       chatID,
+		"current_tier":  paymentData.TierName,
+		"current_level": paymentData.PremiumLevel,
+		"future_tier":   paymentData.FutureTierName,
+		"future_level":  paymentData.FuturePremiumLevel,
+	})
+
+	currentMultiplier := getRepositoryMultiplier(paymentData.PremiumLevel)
+	futureMultiplier := getRepositoryMultiplier(paymentData.FuturePremiumLevel)
+	
+	// Format the scheduled change date
+	changeDate := time.Unix(paymentData.ScheduledChangeDate, 0).Format("2006-01-02")
+	
+	changeText := fmt.Sprintf(`🔄 <b>Subscription Plan Change Scheduled</b>
+
+Your subscription plan will be changed at the end of your current billing period.
+
+<b>Current Plan:</b> %s (%s) - <i>Active until period ends</i>
+<b>Next Plan:</b> %s (%s) - <i>Takes effect %s</i>
+<b>Subscription ID:</b> <code>%s</code>
+
+<b>Current Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<b>Updated Benefits:</b>
+🚀 %dx repository size limit
+👤 Custom commit author with /committer
+🎯 Priority support
+
+<i>Your current plan remains active until the end of this billing period. The change will take effect on %s. 📝</i>
+
+Use /insight to see your current limits.`, 
+		paymentData.TierName, strings.Title(paymentData.BillingPeriod),
+		paymentData.FutureTierName, strings.Title(paymentData.FutureBillingPeriod),
+		changeDate,
+		paymentData.SubscriptionID, 
+		currentMultiplier,
+		futureMultiplier,
+		changeDate)
+
+	msg := tgbotapi.NewMessage(chatID, changeText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send scheduled change notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// sendSubscriptionPaymentIssueNotification sends notification for payment issues
+func (b *Bot) sendSubscriptionPaymentIssueNotification(chatID int64, paymentData *stripe.PaymentData) {
+	issueText := fmt.Sprintf(`⚠️ <b>Subscription Payment Issue</b>
+
+There's an issue with your subscription payment.
+
+<b>Subscription ID:</b> <code>%s</code>
+<b>Status:</b> %s
+
+<b>Action Required:</b>
+Please update your payment method to continue enjoying premium features.
+
+<b>How to fix:</b>
+1. Use /coffee to access subscription management
+2. Click "Customer Portal" to update payment method
+3. Or contact support if you need assistance
+
+<i>Your premium access remains active while we resolve this issue.</i>`, 
+		paymentData.SubscriptionID, 
+		strings.ReplaceAll(paymentData.EventType, "subscription_", ""))
+
+	msg := tgbotapi.NewMessage(chatID, issueText)
+	msg.ParseMode = "html"
+
+	if _, err := b.rateLimitedSend(chatID, msg); err != nil {
+		logger.Error("Failed to send payment issue notification", map[string]interface{}{
+			"error":   err.Error(),
+			"chat_id": chatID,
+		})
+	}
+}
+
+// handleHealth provides health check endpoint
+func (b *Bot) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// isDuplicateCallback checks if a callback has already been processed recently
+func (b *Bot) isDuplicateCallback(callbackID string) bool {
+	b.callbacksMu.RLock()
+	_, exists := b.processedCallbacks[callbackID]
+	b.callbacksMu.RUnlock()
+	return exists
+}
+
+// markCallbackProcessed marks a callback as processed and starts cleanup timer
+func (b *Bot) markCallbackProcessed(callbackID string) {
+	b.callbacksMu.Lock()
+	b.processedCallbacks[callbackID] = time.Now()
+	b.callbacksMu.Unlock()
+	
+	// Clean up old callbacks after 30 seconds to prevent memory leak
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("Panic in callback cleanup", map[string]interface{}{
+					"error": r,
+				})
+			}
+		}()
+		
+		time.Sleep(30 * time.Second)
+		b.callbacksMu.Lock()
+		delete(b.processedCallbacks, callbackID)
+		b.callbacksMu.Unlock()
+	}()
+}

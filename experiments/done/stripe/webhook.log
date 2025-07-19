@@ -1,0 +1,13 @@
+2025/07/02 07:17:39 Starting webhook server on port 8080
+2025/07/02 07:17:39 Endpoints available:
+2025/07/02 07:17:39   - Health: http://localhost:8080/health
+2025/07/02 07:17:39   - Info: http://localhost:8080/
+2025/07/02 07:17:39   - Webhook: http://localhost:8080/stripe/webhook
+2025/07/02 07:17:39 Press Ctrl+C to stop the server
+2025/07/02 07:17:39 Stripe initialized with secret key: sk_test_51...
+2025/07/02 07:17:39 Stripe webhook server starting on port 8080
+2025/07/02 07:18:07 Checkout session completed: cs_test_a198hPnCQlzKy1x76BU1j6tG3PY9V3CYwr7SQYjOWshr8PgyyPF80ynZMO
+2025/07/02 07:18:07 Processing reset usage payment - User: 67890, Amount: $3.75, Session: cs_test_a198hPnCQlzKy1x76BU1j6tG3PY9V3CYwr7SQYjOWshr8PgyyPF80ynZMO
+2025/07/02 07:18:07 ✅ Usage reset successful for user 67890
+2025/07/02 07:18:10 Payment intent succeeded: pi_3RgDRBBSQRXxbnzz2OxVMLcm
+signal: killed
