@@ -8,9 +8,9 @@
 [![Watch 8-minute Demo Video](logo.png)](https://www.youtube.com/watch?v=OJGsxP-D6VM)
 
 [![GitHub stars](https://img.shields.io/github/stars/msg2git/msg2git?style=social)](https://github.com/msg2git/msg2git/stargazers)
-[![Docker Pulls](https://img.shields.io/docker/pulls/msg2git/msg2git)](https://hub.docker.com/r/msg2git/msg2git)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Go Report Card](https://goreportcard.com/badge/github.com/msg2git/msg2git)](https://goreportcard.com/report/github.com/msg2git/msg2git)
+[![Docker Pulls](https://img.shields.io/docker/pulls/msg2git/msg2git?)](https://hub.docker.com/r/msg2git/msg2git)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?)](https://opensource.org/licenses/MIT)
+[![Go Report Card](https://goreportcard.com/badge/github.com/msg2git/msg2git?)](https://goreportcard.com/report/github.com/msg2git/msg2git)
 
 ## 🎆 Quick Start
 
