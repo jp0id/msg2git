@@ -8,18 +8,18 @@ import (
 
 // User represents a Telegram user with their configuration
 type User struct {
-	ID          int       `db:"id" json:"id"`
-	ChatId      int64     `db:"chat_id" json:"chat_id"`
-	Username    string    `db:"username" json:"username"`
-	GitHubToken string    `db:"github_token" json:"github_token"`
-	GitHubRepo  string    `db:"github_repo" json:"github_repo"`
+	ID                  int       `db:"id" json:"id"`
+	ChatId              int64     `db:"chat_id" json:"chat_id"`
+	Username            string    `db:"username" json:"username"`
+	GitHubToken         string    `db:"github_token" json:"github_token"`
+	GitHubRepo          string    `db:"github_repo" json:"github_repo"`
 	LLMToken            string    `db:"llm_token" json:"llm_token"`
 	LLMSwitch           bool      `db:"llm_switch" json:"llm_switch"`
 	LLMMultimodalSwitch bool      `db:"llm_multimodal_switch" json:"llm_multimodal_switch"`
 	CustomFiles         string    `db:"custom_files" json:"custom_files"` // JSON array of custom file paths
-	Committer   string    `db:"committer" json:"committer"`       // Custom commit author
-	CreatedAt   time.Time `db:"created_at" json:"created_at"`
-	UpdatedAt   time.Time `db:"updated_at" json:"updated_at"`
+	Committer           string    `db:"committer" json:"committer"`       // Custom commit author
+	CreatedAt           time.Time `db:"created_at" json:"created_at"`
+	UpdatedAt           time.Time `db:"updated_at" json:"updated_at"`
 }
 
 // UserConfig represents the configuration that can be updated by users
@@ -175,7 +175,7 @@ func GetCustomFileMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 10 // Sponsor: 10x
+		return 100 // Sponsor: 10x
 	default:
 		return 1 // Free: 1x
 	}
@@ -195,7 +195,7 @@ func GetIssueMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 10 // Sponsor: 10x
+		return 100 // Sponsor: 10x
 	default:
 		return 1 // Free: 1x
 	}
@@ -215,7 +215,7 @@ func GetImageMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 10 // Sponsor: 10x
+		return 100 // Sponsor: 10x
 	default:
 		return 1 // Free: 1x
 	}
@@ -235,7 +235,7 @@ func GetTokenMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 10 // Sponsor: 10x
+		return 100 // Sponsor: 10x
 	default:
 		return 1 // Free: 1x
 	}
@@ -318,12 +318,12 @@ type UserUsage struct {
 // ResetLog represents a usage reset operation record
 type ResetLog struct {
 	ID          int       `db:"id" json:"id"`
-	UID         int64     `db:"uid" json:"uid"`                       // User chat ID
-	Issues      int64     `db:"issues" json:"issues"`                 // Issue count before reset
-	Images      int64     `db:"images" json:"images"`                 // Image count before reset
-	TokenInput  int64     `db:"token_input" json:"token_input"`       // Token input count before reset
-	TokenOutput int64     `db:"token_output" json:"token_output"`     // Token output count before reset
-	TopupLogID  int       `db:"topup_log_id" json:"topup_log_id"`     // Reference to payment record
+	UID         int64     `db:"uid" json:"uid"`                   // User chat ID
+	Issues      int64     `db:"issues" json:"issues"`             // Issue count before reset
+	Images      int64     `db:"images" json:"images"`             // Image count before reset
+	TokenInput  int64     `db:"token_input" json:"token_input"`   // Token input count before reset
+	TokenOutput int64     `db:"token_output" json:"token_output"` // Token output count before reset
+	TopupLogID  int       `db:"topup_log_id" json:"topup_log_id"` // Reference to payment record
 	CreatedAt   time.Time `db:"created_at" json:"created_at"`
 }
 
