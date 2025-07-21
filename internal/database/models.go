@@ -175,7 +175,7 @@ func GetCustomFileMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 100 // Sponsor: 10x
+		return 100 // Sponsor: 100x
 	default:
 		return 1 // Free: 1x
 	}
@@ -195,7 +195,7 @@ func GetIssueMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 100 // Sponsor: 10x
+		return 100 // Sponsor: 100x
 	default:
 		return 1 // Free: 1x
 	}
@@ -215,7 +215,7 @@ func GetImageMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 100 // Sponsor: 10x
+		return 100 // Sponsor: 100x
 	default:
 		return 1 // Free: 1x
 	}
@@ -235,7 +235,7 @@ func GetTokenMultiplier(premiumLevel int) int {
 	case 2:
 		return 4 // Cake: 4x
 	case 3:
-		return 100 // Sponsor: 10x
+		return 100 // Sponsor: 100x
 	default:
 		return 1 // Free: 1x
 	}

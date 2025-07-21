@@ -141,7 +141,7 @@ Thank you for supporting the project! 🙏
 
 		// Contact buttons
 		keyboardRows = append(keyboardRows, tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonURL("💬 Priority Support", "https://t.me/NicoNicoGiao"),
+			tgbotapi.NewInlineKeyboardButtonURL("💬 Priority Support", "https://t.me/pm_jp_bot"),
 		))
 
 		// Add website contact link if BASE_URL is configured
