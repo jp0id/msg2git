@@ -502,10 +502,18 @@ func (b *Bot) handleSyncCommand(message *tgbotapi.Message) error {
 	if archivedCount > 0 {
 		// If archiving occurred, commit both files together using prepared archive content
 		commitMsg = fmt.Sprintf("Sync issue statuses via Telegram (archived %d issues)", archivedCount)
-		err = userGitHubProvider.ReplaceMultipleFilesWithAuthorAndPremium(map[string]string{
-			"issue.md":              newContent,
-			consts.IssueArchiveFile: archiveContent,
-		}, commitMsg, committerInfo, premiumLevel)
+		// Use locked version since we already hold the file locks
+		if apiProvider, ok := userGitHubProvider.(*github.APIBasedProvider); ok {
+			err = apiProvider.ReplaceMultipleFilesWithAuthorAndPremiumLocked(map[string]string{
+				"issue.md":              newContent,
+				consts.IssueArchiveFile: archiveContent,
+			}, commitMsg, committerInfo, premiumLevel)
+		} else {
+			err = userGitHubProvider.ReplaceMultipleFilesWithAuthorAndPremium(map[string]string{
+				"issue.md":              newContent,
+				consts.IssueArchiveFile: archiveContent,
+			}, commitMsg, committerInfo, premiumLevel)
+		}
 		if err != nil {
 			logger.Error("Failed to commit updated files", map[string]interface{}{
 				"error": err.Error(),

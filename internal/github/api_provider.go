@@ -90,7 +90,15 @@ func parseRepositoryURL(repoURL string) (owner, repo string, err error) {
 		return owner, repo, nil
 	}
 	
-	return "", "", fmt.Errorf("not a valid GitHub URL")
+	// Handle simple "owner/repo" format
+	pathParts := strings.Split(repoURL, "/")
+	if len(pathParts) == 2 && pathParts[0] != "" && pathParts[1] != "" {
+		owner = pathParts[0]
+		repo = pathParts[1]
+		return owner, repo, nil
+	}
+	
+	return "", "", fmt.Errorf("not a valid GitHub URL or owner/repo format")
 }
 
 // makeAPIRequest makes an authenticated request to GitHub API with rate limiting
