@@ -218,14 +218,28 @@ func (b *Bot) handleIssueClose(callback *tgbotapi.CallbackQuery) error {
 			commitMsg := fmt.Sprintf("Update issue #%d status to closed via Telegram", issueNumber)
 			committerInfo := b.getCommitterInfo(callback.Message.Chat.ID)
 			premiumLevel := b.getPremiumLevel(callback.Message.Chat.ID)
-			if err := userGitHubProvider.ReplaceFileWithAuthorAndPremium("issue.md", updatedContent, commitMsg, committerInfo, premiumLevel); err != nil {
-				logger.Error("Failed to update issue.md status", map[string]interface{}{
-					"error": err.Error(),
-				})
+			
+			// Use locked version since we already hold the file lock
+			if apiProvider, ok := userGitHubProvider.(*github.APIBasedProvider); ok {
+				if err := apiProvider.ReplaceFileWithAuthorAndPremiumLocked("issue.md", updatedContent, commitMsg, committerInfo, premiumLevel); err != nil {
+					logger.Error("Failed to update issue.md status", map[string]interface{}{
+						"error": err.Error(),
+					})
+				} else {
+					logger.Info("Successfully updated issue.md status", map[string]interface{}{
+						"issue_number": issueNumber,
+					})
+				}
 			} else {
-				logger.Info("Successfully updated issue.md status", map[string]interface{}{
-					"issue_number": issueNumber,
-				})
+				if err := userGitHubProvider.ReplaceFileWithAuthorAndPremium("issue.md", updatedContent, commitMsg, committerInfo, premiumLevel); err != nil {
+					logger.Error("Failed to update issue.md status", map[string]interface{}{
+						"error": err.Error(),
+					})
+				} else {
+					logger.Info("Successfully updated issue.md status", map[string]interface{}{
+						"issue_number": issueNumber,
+					})
+				}
 			}
 		}
 	}
@@ -754,10 +768,20 @@ You've used %d/%d issues on the %s tier.%s
 	commitMsg := fmt.Sprintf("Add issue link: %s to issue.md via Telegram", title)
 	committerInfo := b.getCommitterInfo(callback.Message.Chat.ID)
 	premiumLevel = b.getPremiumLevel(callback.Message.Chat.ID)
-	if err := userGitHubProvider.CommitFileWithAuthorAndPremium("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
-		logger.Error("Failed to save issue link", map[string]interface{}{
-			"error": err.Error(),
-		})
+	
+	// Use locked version since we already hold the file lock
+	if apiProvider, ok := userGitHubProvider.(*github.APIBasedProvider); ok {
+		if err := apiProvider.CommitFileWithAuthorAndPremiumLocked("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
+			logger.Error("Failed to save issue link", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	} else {
+		if err := userGitHubProvider.CommitFileWithAuthorAndPremium("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
+			logger.Error("Failed to save issue link", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
 	}
 
 	// Update repo size after saving issue link
@@ -1201,10 +1225,20 @@ You've used %d/%d issues on the %s tier.%s
 	commitMsg := fmt.Sprintf("Add photo issue link: %s to issue.md via Telegram", title)
 	committerInfo := b.getCommitterInfo(callback.Message.Chat.ID)
 	premiumLevel = b.getPremiumLevel(callback.Message.Chat.ID)
-	if err := userGitHubProvider.CommitFileWithAuthorAndPremium("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
-		logger.Error("Failed to save issue link", map[string]interface{}{
-			"error": err.Error(),
-		})
+	
+	// Use locked version since we already hold the file lock
+	if apiProvider, ok := userGitHubProvider.(*github.APIBasedProvider); ok {
+		if err := apiProvider.CommitFileWithAuthorAndPremiumLocked("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
+			logger.Error("Failed to save issue link", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
+	} else {
+		if err := userGitHubProvider.CommitFileWithAuthorAndPremium("issue.md", linkContent, commitMsg, committerInfo, premiumLevel); err != nil {
+			logger.Error("Failed to save issue link", map[string]interface{}{
+				"error": err.Error(),
+			})
+		}
 	}
 
 	// Update repo size after saving photo issue link

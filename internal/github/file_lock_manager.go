@@ -68,16 +68,14 @@ func (flm *FileLockManager) generateLockKey(userID int64, repoURL, filename stri
 	// Extract owner/repo from repository URL
 	owner, repo, err := parseRepositoryURL(repoURL)
 	if err != nil {
-		// Fallback to old format if parsing fails
-		logger.Warn("Failed to parse repository URL for lock key, using fallback", map[string]interface{}{
+		// Log error but still create a consistent key format
+		logger.Error("Failed to parse repository URL for lock key", map[string]interface{}{
 			"repo_url": repoURL,
 			"error":    err.Error(),
+			"user_id":  userID,
 		})
-		if repoURL == "" {
-			return fmt.Sprintf("%d:%s:%s", userID, repoURL, filename)
-		} else {
-			return fmt.Sprintf("%s:%s", repoURL, filename)
-		}
+		// Use the original repoURL as fallback but ensure consistent format
+		return fmt.Sprintf("%s:%s", repoURL, filename)
 	}
 
 	return fmt.Sprintf("%s/%s:%s", owner, repo, filename)

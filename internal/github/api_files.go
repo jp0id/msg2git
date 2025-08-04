@@ -128,6 +128,12 @@ func (p *APIBasedProvider) CommitFileWithAuthorAndPremium(filename, content, com
 	return p.updateFileContent(filename, content, commitMessage, customAuthor, true) // true = prepend mode
 }
 
+// CommitFileWithAuthorAndPremiumLocked performs file commit with the assumption that the file is already locked
+func (p *APIBasedProvider) CommitFileWithAuthorAndPremiumLocked(filename, content, commitMessage, customAuthor string, premiumLevel int) error {
+	// For msg2git's use case, CommitFile means "prepend" to existing file
+	return p.updateFileContentLocked(filename, content, commitMessage, customAuthor, true) // true = prepend mode
+}
+
 func (p *APIBasedProvider) ReplaceFile(filename, content, commitMessage string) error {
 	return p.ReplaceFileWithAuthorAndPremium(filename, content, commitMessage, p.config.Config.GetCommitAuthor(), p.config.PremiumLevel)
 }
@@ -139,6 +145,12 @@ func (p *APIBasedProvider) ReplaceFileWithAuthor(filename, content, commitMessag
 func (p *APIBasedProvider) ReplaceFileWithAuthorAndPremium(filename, content, commitMessage, customAuthor string, premiumLevel int) error {
 	// Replace mode - completely replace file content
 	return p.updateFileContent(filename, content, commitMessage, customAuthor, false) // false = replace mode
+}
+
+// ReplaceFileWithAuthorAndPremiumLocked performs file replacement with the assumption that the file is already locked
+func (p *APIBasedProvider) ReplaceFileWithAuthorAndPremiumLocked(filename, content, commitMessage, customAuthor string, premiumLevel int) error {
+	// Replace mode - completely replace file content
+	return p.updateFileContentLocked(filename, content, commitMessage, customAuthor, false) // false = replace mode
 }
 
 func (p *APIBasedProvider) CommitBinaryFile(filename string, data []byte, commitMessage string) error {
@@ -207,11 +219,11 @@ func (p *APIBasedProvider) replaceMultipleFilesWithLocks(ctx context.Context, fl
 	})
 	
 	// Now perform the actual file replacement with all locks held
-	return p.replaceMultipleFilesWithAuthorAndPremiumLocked(files, commitMessage, customAuthor, premiumLevel)
+	return p.ReplaceMultipleFilesWithAuthorAndPremiumLocked(files, commitMessage, customAuthor, premiumLevel)
 }
 
-// replaceMultipleFilesWithAuthorAndPremiumLocked performs the actual file replacement with the assumption that all files are locked
-func (p *APIBasedProvider) replaceMultipleFilesWithAuthorAndPremiumLocked(files map[string]string, commitMessage, customAuthor string, premiumLevel int) error {
+// ReplaceMultipleFilesWithAuthorAndPremiumLocked performs the actual file replacement with the assumption that all files are locked
+func (p *APIBasedProvider) ReplaceMultipleFilesWithAuthorAndPremiumLocked(files map[string]string, commitMessage, customAuthor string, premiumLevel int) error {
 	logger.Debug("Starting locked multiple file replacement via API", map[string]interface{}{
 		"file_count": len(files),
 		"user_id":    p.config.UserID,
